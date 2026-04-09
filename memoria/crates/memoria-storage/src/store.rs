@@ -914,8 +914,9 @@ impl SqlMemoryStore {
     }
 
     async fn bootstrap_user_schema(&self, pool: &MySqlPool) -> Result<(), MemoriaError> {
+        let t = |n: &str| self.t(n);
         let sql = format!(
-            r#"CREATE TABLE IF NOT EXISTS mem_memories (
+            "CREATE TABLE IF NOT EXISTS {} (
                 memory_id       VARCHAR(64)  PRIMARY KEY,
                 user_id         VARCHAR(64)  NOT NULL,
                 memory_type     VARCHAR(20)  NOT NULL,
@@ -935,24 +936,23 @@ impl SqlMemoryStore {
                 INDEX idx_user_session (user_id, session_id),
                 INDEX idx_memories_user_observed (user_id, observed_at),
                 FULLTEXT INDEX ft_content (content) WITH PARSER ngram -- MO#23861: breaks on concurrent snapshot restore
-            )"#,
-            dim = self.embedding_dim
+            )", t("mem_memories"), dim = self.embedding_dim
         );
         sqlx::query(&sql).execute(pool).await.map_err(db_err)?;
 
-        sqlx::query(
-            r#"CREATE TABLE IF NOT EXISTS mem_user_state (
+        sqlx::query(&format!(
+            "CREATE TABLE IF NOT EXISTS {} (
                 user_id       VARCHAR(64)  PRIMARY KEY,
                 active_branch VARCHAR(100) NOT NULL DEFAULT 'main',
                 updated_at    DATETIME(6)
-            )"#,
-        )
+            )", t("mem_branches")
+        ))
         .execute(pool)
         .await
         .map_err(db_err)?;
 
-        sqlx::query(
-            r#"CREATE TABLE IF NOT EXISTS mem_branches (
+        sqlx::query(&format!(
+            "CREATE TABLE IF NOT EXISTS {} (
                 id          VARCHAR(64)  PRIMARY KEY,
                 user_id     VARCHAR(64)  NOT NULL,
                 name        VARCHAR(100) NOT NULL,
@@ -960,14 +960,14 @@ impl SqlMemoryStore {
                 status      VARCHAR(20)  NOT NULL DEFAULT 'active',
                 created_at  DATETIME(6)  NOT NULL,
                 INDEX idx_user_name (user_id, name)
-            )"#,
-        )
+            )", t("mem_snapshots")
+        ))
         .execute(pool)
         .await
         .map_err(db_err)?;
 
-        sqlx::query(
-            r#"CREATE TABLE IF NOT EXISTS mem_snapshots (
+        sqlx::query(&format!(
+            "CREATE TABLE IF NOT EXISTS {} (
                 id             VARCHAR(64)  PRIMARY KEY,
                 user_id        VARCHAR(64)  NOT NULL,
                 name           VARCHAR(100) NOT NULL,
@@ -976,26 +976,26 @@ impl SqlMemoryStore {
                 created_at     DATETIME(6)  NOT NULL,
                 INDEX idx_user_snapshot_name (user_id, name, status),
                 INDEX idx_user_snapshot_internal (user_id, snapshot_name, status)
-            )"#,
-        )
+            )", t("mem_governance_cooldown")
+        ))
         .execute(pool)
         .await
         .map_err(db_err)?;
 
-        sqlx::query(
-            r#"CREATE TABLE IF NOT EXISTS mem_governance_cooldown (
+        sqlx::query(&format!(
+            "CREATE TABLE IF NOT EXISTS {} (
                 user_id     VARCHAR(64)  NOT NULL,
                 operation   VARCHAR(32)  NOT NULL,
                 last_run_at DATETIME(6)  NOT NULL,
                 PRIMARY KEY (user_id, operation)
-            )"#,
-        )
+            )", t("mem_entity_links")
+        ))
         .execute(pool)
         .await
         .map_err(db_err)?;
 
-        sqlx::query(
-            r#"CREATE TABLE IF NOT EXISTS mem_entity_links (
+        sqlx::query(&format!(
+            "CREATE TABLE IF NOT EXISTS {} (
                 id          VARCHAR(64)  PRIMARY KEY,
                 user_id     VARCHAR(64)  NOT NULL,
                 memory_id   VARCHAR(64)  NOT NULL,
@@ -1005,14 +1005,14 @@ impl SqlMemoryStore {
                 created_at  DATETIME(6)  NOT NULL,
                 INDEX idx_user_memory (user_id, memory_id),
                 INDEX idx_user_entity (user_id, entity_name)
-            )"#,
-        )
+            )", t("mem_memories_stats")
+        ))
         .execute(pool)
         .await
         .map_err(db_err)?;
 
-        sqlx::query(
-            r#"CREATE TABLE IF NOT EXISTS mem_memories_stats (
+        sqlx::query(&format!(
+            "CREATE TABLE IF NOT EXISTS {} (
                 memory_id        VARCHAR(64)  PRIMARY KEY,
                 access_count     INT          NOT NULL DEFAULT 0,
                 last_accessed_at DATETIME(6),
@@ -1021,14 +1021,14 @@ impl SqlMemoryStore {
                 feedback_outdated INT         NOT NULL DEFAULT 0,
                 feedback_wrong   INT          NOT NULL DEFAULT 0,
                 last_feedback_at DATETIME(6)
-            )"#,
-        )
+            )", t("mem_edit_log")
+        ))
         .execute(pool)
         .await
         .map_err(db_err)?;
 
-        sqlx::query(
-            r#"CREATE TABLE IF NOT EXISTS mem_edit_log (
+        sqlx::query(&format!(
+            "CREATE TABLE IF NOT EXISTS {} (
                 edit_id         VARCHAR(64)  NOT NULL,
                 user_id         VARCHAR(64)  NOT NULL,
                 memory_id       VARCHAR(64)  DEFAULT NULL,
@@ -1040,14 +1040,14 @@ impl SqlMemoryStore {
                 created_by      VARCHAR(64)  NOT NULL,
                 INDEX idx_user_time (user_id, created_at),
                 INDEX idx_memory_time (memory_id, created_at)
-            ) CLUSTER BY (created_at, user_id)"#,
-        )
+            ) CLUSTER BY (created_at, user_id)", t("mem_retrieval_feedback")
+        ))
         .execute(pool)
         .await
         .map_err(db_err)?;
 
-        sqlx::query(
-            r#"CREATE TABLE IF NOT EXISTS mem_retrieval_feedback (
+        sqlx::query(&format!(
+            "CREATE TABLE IF NOT EXISTS {} (
                 id          VARCHAR(64)  PRIMARY KEY,
                 user_id     VARCHAR(64)  NOT NULL,
                 memory_id   VARCHAR(64)  NOT NULL,
@@ -1058,39 +1058,39 @@ impl SqlMemoryStore {
                 INDEX idx_feedback_memory (memory_id),
                 INDEX idx_feedback_memory_user (user_id, memory_id),
                 INDEX idx_feedback_created_at (created_at)
-            )"#,
-        )
+            )", t("mem_user_retrieval_params")
+        ))
         .execute(pool)
         .await
         .map_err(db_err)?;
 
-        sqlx::query(
-            r#"CREATE TABLE IF NOT EXISTS mem_user_retrieval_params (
+        sqlx::query(&format!(
+            "CREATE TABLE IF NOT EXISTS {} (
                 user_id              VARCHAR(64)  PRIMARY KEY,
                 feedback_weight      DOUBLE       NOT NULL DEFAULT 0.1,
                 temporal_decay_hours DOUBLE       NOT NULL DEFAULT 168.0,
                 confidence_weight    DOUBLE       NOT NULL DEFAULT 0.1,
                 updated_at           DATETIME(6)  NOT NULL
-            )"#,
-        )
+            )", t("mem_tool_usage")
+        ))
         .execute(pool)
         .await
         .map_err(db_err)?;
 
-        sqlx::query(
-            r#"CREATE TABLE IF NOT EXISTS mem_tool_usage (
+        sqlx::query(&format!(
+            "CREATE TABLE IF NOT EXISTS {} (
                 user_id      VARCHAR(64)  NOT NULL,
                 tool_name    VARCHAR(128) NOT NULL,
                 last_used_at DATETIME(6)  NOT NULL,
                 PRIMARY KEY (user_id, tool_name)
-            )"#,
-        )
+            )", t("mem_tool_usage")
+        ))
         .execute(pool)
         .await
         .map_err(db_err)?;
 
-        sqlx::query(
-            r#"CREATE TABLE IF NOT EXISTS mem_api_call_log (
+        sqlx::query(&format!(
+            "CREATE TABLE IF NOT EXISTS {} (
                 id              BIGINT       NOT NULL AUTO_INCREMENT,
                 user_id         VARCHAR(64)  NOT NULL,
                 method          VARCHAR(10)  NOT NULL DEFAULT '',
@@ -1102,8 +1102,8 @@ impl SqlMemoryStore {
                 rpc_error_code  INT          NULL,
                 PRIMARY KEY (id),
                 INDEX idx_user_called (user_id, called_at)
-            )"#,
-        )
+            )", t("mem_api_call_log")
+        ))
         .execute(pool)
         .await
         .map_err(db_err)?;
@@ -2161,7 +2161,6 @@ impl SqlMemoryStore {
             .collect()
     }
 
-
     pub async fn count_snapshot_registrations(&self, user_id: &str) -> Result<i64, MemoriaError> {
         let snapshots_table = self.t("mem_snapshots");
         sqlx::query_scalar(&format!(
@@ -2172,6 +2171,7 @@ impl SqlMemoryStore {
         .await
         .map_err(db_err)
     }
+
     pub async fn deregister_snapshot(&self, user_id: &str, name: &str) -> Result<(), MemoriaError> {
         let snapshots_table = self.t("mem_snapshots");
         sqlx::query(&format!(
