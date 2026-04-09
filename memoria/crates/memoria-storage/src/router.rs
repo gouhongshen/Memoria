@@ -100,6 +100,16 @@ impl DbRouter {
             "Global user pool initialized (statement_cache=0)"
         );
 
+        // Monitor global user pool health — this is the main pool for all user queries
+        let global_health = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::store::PoolHealthSnapshot::new(Some(global_max)),
+        ));
+        crate::store::spawn_pool_monitor(
+            global_user_pool.clone(),
+            Some(global_max),
+            global_health,
+        );
+
         let shared_db_name = parse_db_name(shared_db_url)
             .ok_or_else(|| MemoriaError::Internal("invalid shared_db_url".into()))?;
         let user_init_max: usize = std::env::var("MEMORIA_USER_SCHEMA_INIT_MAX_CONCURRENCY")

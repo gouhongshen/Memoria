@@ -261,7 +261,7 @@ pub struct PoolHealthSnapshot {
 }
 
 impl PoolHealthSnapshot {
-    fn new(configured_max_connections: Option<u32>) -> Self {
+    pub fn new(configured_max_connections: Option<u32>) -> Self {
         Self {
             configured_max_connections,
             size: 0,
