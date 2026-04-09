@@ -451,8 +451,10 @@ pub async fn call(
         }
 
         ToolCallName::MemoryList => {
+            let t0 = std::time::Instant::now();
             let limit = args["limit"].as_i64().unwrap_or(20);
             let memories = service.list_active(user_id, limit).await?;
+            memoria_service::phase_metrics::record("memory_list", "total", t0.elapsed().as_secs_f64());
             if memories.is_empty() {
                 return Ok(mcp_text("No memories found."));
             }

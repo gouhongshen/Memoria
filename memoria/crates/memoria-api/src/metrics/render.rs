@@ -218,6 +218,31 @@ pub fn render_process_metrics(out: &mut String) {
         &["tool", "phase"],
         &mut reg.tool.phase_duration.snapshot(),
     );
+
+    // ── Service-layer phase durations ────────────────────────────────────
+    out.push_str("# HELP memoria_phase_duration_seconds Service-layer per-tool per-phase duration.\n");
+    out.push_str("# TYPE memoria_phase_duration_seconds histogram\n");
+    for (key, snap) in memoria_service::phase_metrics::snapshot() {
+        let parts: Vec<&str> = key.splitn(2, '|').collect();
+        if parts.len() != 2 { continue; }
+        let (tool, phase) = (parts[0], parts[1]);
+        for (i, &bound) in memoria_service::phase_metrics::BOUNDS.iter().enumerate() {
+            out.push_str(&format!(
+                "memoria_phase_duration_seconds_bucket{{tool=\"{tool}\",phase=\"{phase}\",le=\"{bound}\"}} {}\n",
+                snap.buckets[i]
+            ));
+        }
+        out.push_str(&format!(
+            "memoria_phase_duration_seconds_bucket{{tool=\"{tool}\",phase=\"{phase}\",le=\"+Inf\"}} {}\n",
+            snap.buckets[memoria_service::phase_metrics::BOUNDS.len()]
+        ));
+        out.push_str(&format!(
+            "memoria_phase_duration_seconds_sum{{tool=\"{tool}\",phase=\"{phase}\"}} {}\n", snap.sum
+        ));
+        out.push_str(&format!(
+            "memoria_phase_duration_seconds_count{{tool=\"{tool}\",phase=\"{phase}\"}} {}\n", snap.count
+        ));
+    }
 }
 
 #[cfg(test)]

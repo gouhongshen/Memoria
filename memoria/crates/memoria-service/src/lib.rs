@@ -2,6 +2,7 @@ pub mod config;
 pub mod distributed;
 pub mod governance;
 pub mod graph_domains;
+pub mod phase_metrics;
 pub mod pipeline;
 pub mod plugin;
 pub mod plugin_registry;

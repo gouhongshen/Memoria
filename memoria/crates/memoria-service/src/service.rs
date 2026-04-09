@@ -7,7 +7,7 @@ use memoria_core::{
 use memoria_embedding::llm::ChatMessage;
 use memoria_embedding::LlmClient;
 use memoria_storage::{DbRouter, OwnedEditLogEntry, SqlMemoryStore};
-use moka::sync::Cache;
+use crate::phase_metrics;use moka::sync::Cache;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,6 +20,18 @@ pub static ENTITY_EXTRACTION_DROPS: AtomicU64 = AtomicU64::new(0);
 #[inline]
 fn round4(v: f64) -> f64 {
     (v * 10000.0).round() / 10000.0
+}
+
+fn record_retrieve_phases(explain: &RetrievalExplain) {
+    let tool = "memory_search";
+    phase_metrics::record(tool, "embed", explain.embedding_ms / 1000.0);
+    phase_metrics::record(tool, "graph", explain.graph_ms / 1000.0);
+    phase_metrics::record(tool, "vector", explain.vector_ms / 1000.0);
+    // rank = total - embed - max(graph, vector) for parallel execution
+    let parallel = explain.graph_ms.max(explain.vector_ms);
+    let rank_ms = (explain.total_ms - explain.embedding_ms - parallel).max(0.0);
+    phase_metrics::record(tool, "rank", rank_ms / 1000.0);
+    phase_metrics::record(tool, "total", explain.total_ms / 1000.0);
 }
 
 /// Explain level — mirrors Python's ExplainLevel enum.
@@ -1114,6 +1126,9 @@ impl MemoryService {
                 let t2 = std::time::Instant::now();
                 sql.insert_into(&table, &memory).await?;
                 let t_insert = t2.elapsed();
+                phase_metrics::record("memory_store", "embed", t_embed.as_secs_f64());
+                phase_metrics::record("memory_store", "dedup", t_dedup.as_secs_f64());
+                phase_metrics::record("memory_store", "insert", t_insert.as_secs_f64());
                 let payload = serde_json::json!({"content": &memory.content, "type": memory.memory_type.to_string()}).to_string();
                 self.send_edit_log(
                     user_id,
@@ -1158,6 +1173,7 @@ impl MemoryService {
         } else {
             self.store.insert(&memory).await?;
         }
+        phase_metrics::record("memory_store", "total", t0.elapsed().as_secs_f64());
         Ok(memory)
     }
 
@@ -1226,10 +1242,11 @@ impl MemoryService {
         query: &str,
         top_k: i64,
     ) -> Result<Vec<Memory>, MemoriaError> {
-        let (mems, _) = self
+        let (mems, explain) = self
             .retrieve_inner(user_id, query, top_k, ExplainLevel::None)
             .await?;
         self.bump_access_counts(&mems);
+        record_retrieve_phases(&explain);
         Ok(mems)
     }
 
@@ -1244,6 +1261,7 @@ impl MemoryService {
             .retrieve_inner(user_id, query, top_k, ExplainLevel::Basic)
             .await?;
         self.bump_access_counts(&mems);
+        record_retrieve_phases(&explain);
         Ok((mems, explain))
     }
 
@@ -1589,6 +1607,7 @@ impl MemoryService {
         memory_id: &str,
         new_content: &str,
     ) -> Result<Memory, MemoriaError> {
+        let t0 = std::time::Instant::now();
         // Sensitivity check — same as store_memory
         let sensitivity = check_sensitivity(new_content);
         if sensitivity.blocked {
@@ -1661,6 +1680,7 @@ impl MemoryService {
             self.enqueue_entity_extraction(user_id, &new_mem.memory_id, new_content)
                 .await;
 
+            phase_metrics::record("memory_correct", "total", t0.elapsed().as_secs_f64());
             Ok(new_mem)
         } else {
             // Non-SQL fallback (tests with MockStore)

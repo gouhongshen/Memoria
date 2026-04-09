@@ -499,6 +499,7 @@ pub async fn call(
     };
     match tool {
         GitToolCallName::MemorySnapshot => {
+            let t0 = std::time::Instant::now();
             let snap_name = args["name"].as_str().unwrap_or("");
             let sql = snapshot_store(svc, user_id).await?;
             let db_name = sql.database_name().ok_or_else(|| {
@@ -544,6 +545,7 @@ pub async fn call(
                 }
             };
             sql.register_snapshot(user_id, &display, &snap.snapshot_name).await?;
+            memoria_service::phase_metrics::record("memory_snapshot", "total", t0.elapsed().as_secs_f64());
             Ok(mcp_text(&format!(
                 "Snapshot '{}' created at {:?}",
                 display, snap.timestamp
@@ -642,6 +644,7 @@ pub async fn call(
         }
 
         GitToolCallName::MemoryRollback => {
+            let t0 = std::time::Instant::now();
             let sql = snapshot_store(svc, user_id).await?;
             let git = git_for_store(&sql)?;
             let snap_name = args["name"].as_str().unwrap_or("");
@@ -660,6 +663,7 @@ pub async fn call(
             );
             let _ = (r1, r2, r3); // best-effort
             sql.invalidate_user_caches(user_id).await;
+            memoria_service::phase_metrics::record("memory_rollback", "total", t0.elapsed().as_secs_f64());
             Ok(mcp_text(&format!("Rolled back to snapshot '{snap_name}'")))
         }
 
