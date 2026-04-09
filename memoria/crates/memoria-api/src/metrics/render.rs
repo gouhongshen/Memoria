@@ -222,6 +222,10 @@ pub fn render_process_metrics(out: &mut String) {
     // ── Service-layer phase durations ────────────────────────────────────
     out.push_str("# HELP memoria_phase_duration_seconds Service-layer per-tool per-phase duration.\n");
     out.push_str("# TYPE memoria_phase_duration_seconds histogram\n");
+
+    // ── DB RTT probe ─────────────────────────────────────────────────────
+    memoria_service::rtt_probe::render(out);
+
     for (key, snap) in memoria_service::phase_metrics::snapshot() {
         let parts: Vec<&str> = key.splitn(2, '|').collect();
         if parts.len() != 2 { continue; }

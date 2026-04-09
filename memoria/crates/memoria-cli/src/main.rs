@@ -489,6 +489,10 @@ async fn cmd_serve(db_url: Option<String>, port: u16, master_key: String) -> Res
 
     let app = build_router(state.clone()).layer(TraceLayer::new_for_http());
     let addr = format!("0.0.0.0:{}", port);
+    // Start DB RTT probe on the main SQL pool
+    if let Some(sql) = service.sql_store.as_ref() {
+        memoria_service::rtt_probe::spawn_rtt_probe(sql.pool().clone());
+    }
     tracing::info!("Listening on {addr}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     run_with_edit_log_drain(
