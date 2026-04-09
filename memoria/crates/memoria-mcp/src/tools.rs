@@ -364,7 +364,7 @@ pub async fn call(
                     "{text}\n\n--- explain ---\n{explain_json}"
                 )))
             } else {
-                let results = service.retrieve(user_id, &query, top_k).await?;
+                let (results, _stats) = service.retrieve_with_timings(user_id, &query, top_k).await?;
                 if results.is_empty() {
                     return Ok(mcp_text("No relevant memories found."));
                 }
