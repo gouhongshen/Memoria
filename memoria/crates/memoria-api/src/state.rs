@@ -128,7 +128,7 @@ impl AppState {
             let raw: u64 = std::env::var("MEMORIA_METRICS_CACHE_TTL_SECS")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(5);
+                .unwrap_or(25);
             let clamped = raw.clamp(1, METRICS_CACHE_TTL_MAX_SECS);
             if clamped != raw {
                 warn!(
