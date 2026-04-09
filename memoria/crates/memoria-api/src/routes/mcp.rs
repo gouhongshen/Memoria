@@ -245,21 +245,32 @@ pub async fn mcp_handler(
     .await
     {
         Ok(v) => {
+            // Record tool duration metric
+            if let Some(tool) = tracked_tool.as_deref() {
+                let secs = t.elapsed().as_secs_f64();
+                crate::metrics::registry().tool.record(tool, "total", secs);
+            }
             let result = if v.is_null() { json!({}) } else { v };
             (
                 Json(json!({"jsonrpc": "2.0", "id": id, "result": result})).into_response(),
                 RpcMeta::ok(),
             )
         }
-        Err(e) => (
-            Json(json!({
+        Err(e) => {
+            if let Some(tool) = tracked_tool.as_deref() {
+                let secs = t.elapsed().as_secs_f64();
+                crate::metrics::registry().tool.record(tool, "total", secs);
+            }
+            (
+                Json(json!({
                 "jsonrpc": "2.0",
                 "id": id,
                 "error": {"code": e.code, "message": e.message}
             }))
             .into_response(),
-            RpcMeta::err(e.code),
-        ),
+                RpcMeta::err(e.code),
+            )
+        }
     };
 
     if rpc.success {

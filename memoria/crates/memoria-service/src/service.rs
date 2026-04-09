@@ -1233,6 +1233,20 @@ impl MemoryService {
         Ok(mems)
     }
 
+    /// Retrieve and return phase timings (for metrics). Always computes timings.
+    pub async fn retrieve_with_timings(
+        &self,
+        user_id: &str,
+        query: &str,
+        top_k: i64,
+    ) -> Result<(Vec<Memory>, RetrievalExplain), MemoriaError> {
+        let (mems, explain) = self
+            .retrieve_inner(user_id, query, top_k, ExplainLevel::Basic)
+            .await?;
+        self.bump_access_counts(&mems);
+        Ok((mems, explain))
+    }
+
     /// Retrieve with explain stats at the given level.
     pub async fn retrieve_explain(
         &self,

@@ -209,6 +209,15 @@ pub fn render_process_metrics(out: &mut String) {
         &["provider", "operation"],
         &mut reg.embedding.errors_total.snapshot(),
     );
+
+    // ── Tool phase durations ─────────────────────────────────────────────
+    histogram_vec(
+        out,
+        "memoria_tool_duration_seconds",
+        "MCP tool execution duration by tool and phase.",
+        &["tool", "phase"],
+        &mut reg.tool.phase_duration.snapshot(),
+    );
 }
 
 #[cfg(test)]

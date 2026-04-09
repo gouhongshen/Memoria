@@ -33,6 +33,7 @@ pub mod http;
 pub mod middleware;
 pub mod render;
 pub mod security;
+pub mod tool;
 pub mod types;
 pub mod worker;
 
@@ -51,6 +52,8 @@ pub struct Registry {
     pub worker: worker::WorkerMetrics,
     /// Embedding sub-system: call latency and error rate.
     pub embedding: embedding::EmbeddingMetrics,
+    /// Per-tool per-phase duration histograms.
+    pub tool: tool::ToolMetrics,
 }
 
 impl Registry {
@@ -60,6 +63,7 @@ impl Registry {
             security: security::SecurityMetrics::new(),
             worker: worker::WorkerMetrics::new(),
             embedding: embedding::EmbeddingMetrics::new(),
+            tool: tool::ToolMetrics::new(),
         }
     }
 }
