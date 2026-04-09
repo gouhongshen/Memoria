@@ -3157,11 +3157,10 @@ impl SqlMemoryStore {
 
     /// Release a distributed lock.
     pub async fn release_lock(&self, key: &str) -> Result<(), MemoriaError> {
-        let mut conn = self.conn().await?;
-        sqlx::query("DELETE FROM mem_distributed_locks WHERE lock_key = ? AND holder_id = ?")
+        sqlx::query(&self.tq("DELETE FROM mem_distributed_locks WHERE lock_key = ? AND holder_id = ?"))
             .bind(key)
             .bind(&self.instance_id)
-            .execute(&mut *conn)
+            .execute(&self.pool)
             .await
             .map_err(db_err)?;
         Ok(())
@@ -3841,14 +3840,13 @@ impl SqlMemoryStore {
     /// Mark a memory as superseded by another.
     /// Branch-aware soft-delete: deactivate a memory in the given table.
     pub async fn soft_delete_from(&self, table: &str, memory_id: &str) -> Result<(), MemoriaError> {
-        let mut conn = self.conn().await?;
         let now = Utc::now().naive_utc();
         sqlx::query(&format!(
             "UPDATE {table} SET is_active = 0, updated_at = ? WHERE memory_id = ?"
         ))
         .bind(now)
         .bind(memory_id)
-        .execute(&mut *conn)
+        .execute(&self.pool)
         .await
         .map_err(db_err)?;
         Ok(())
@@ -4485,10 +4483,9 @@ impl SqlMemoryStore {
         &self,
         user_id: &str,
     ) -> Result<std::collections::HashSet<String>, MemoriaError> {
-        let mut conn = self.conn().await?;
-        let rows = sqlx::query("SELECT DISTINCT memory_id FROM mem_entity_links WHERE user_id = ?")
+        let rows = sqlx::query(&self.tq("SELECT DISTINCT memory_id FROM mem_entity_links WHERE user_id = ?"))
             .bind(user_id)
-            .fetch_all(&mut *conn)
+            .fetch_all(&self.pool)
             .await
             .map_err(db_err)?;
         Ok(rows
@@ -4502,12 +4499,11 @@ impl SqlMemoryStore {
         &self,
         user_id: &str,
     ) -> Result<Vec<(String, String)>, MemoriaError> {
-        let mut conn = self.conn().await?;
-        let rows = sqlx::query(
+        let rows = sqlx::query(&self.tq(
             "SELECT DISTINCT entity_name, entity_type FROM mem_entity_links WHERE user_id = ? ORDER BY entity_name"
-        )
+        ))
         .bind(user_id)
-        .fetch_all(&mut *conn).await.map_err(db_err)?;
+        .fetch_all(&self.pool).await.map_err(db_err)?;
         Ok(rows
             .iter()
             .filter_map(|r| {
