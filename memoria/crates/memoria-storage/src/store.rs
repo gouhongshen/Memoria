@@ -674,15 +674,9 @@ impl SqlMemoryStore {
     /// only use `conn()` in methods with ≤~18 queries. For larger migration
     /// methods, use `self.t()` for qualified table names with `&self.pool`.
     #[allow(dead_code)]
+    #[allow(dead_code)]
     async fn conn(&self) -> Result<sqlx::pool::PoolConnection<sqlx::MySql>, MemoriaError> {
-        let mut c = self.pool.acquire().await.map_err(db_err)?;
-        if let Some(db) = &self.db_name {
-            sqlx::query(&format!("USE `{}`", db.replace('`', "``")))
-                .execute(&mut *c)
-                .await
-                .map_err(db_err)?;
-        }
-        Ok(c)
+        self.pool.acquire().await.map_err(db_err)
     }
 
     async fn direct_pool(&self) -> Result<MySqlPool, MemoriaError> {
@@ -2927,7 +2921,6 @@ impl SqlMemoryStore {
         &self,
         table: &str,
     ) -> Result<(bool, i64, Option<i64>), MemoriaError> {
-        let mut conn = self.conn().await?;
         Self::validate_table_name(table)?;
         let key = format!("vector_index_rebuild:{table}");
 
@@ -2937,7 +2930,7 @@ impl SqlMemoryStore {
              WHERE strategy_key = ? AND task = 'rebuild'",
         )
         .bind(&key)
-        .fetch_optional(&mut *conn)
+        .fetch_optional(&self.pool)
         .await
         .map_err(db_err)?;
 
@@ -2953,7 +2946,7 @@ impl SqlMemoryStore {
         let current_rows: i64 = sqlx::query_scalar(&format!(
             "SELECT COUNT(*) FROM {table} WHERE embedding IS NOT NULL"
         ))
-        .fetch_one(&mut *conn)
+        .fetch_one(&self.pool)
         .await
         .unwrap_or_default(); // 表不存在或查询失败，返回0
 
@@ -2963,7 +2956,7 @@ impl SqlMemoryStore {
              WHERE strategy_key = ? AND task = 'rebuild'",
         )
         .bind(&key)
-        .fetch_optional(&mut *conn)
+        .fetch_optional(&self.pool)
         .await
         .map_err(db_err)?;
 
@@ -2989,7 +2982,6 @@ impl SqlMemoryStore {
         row_count: i64,
         cooldown_secs: i64,
     ) -> Result<(), MemoriaError> {
-        let mut conn = self.conn().await?;
         Self::validate_table_name(table)?;
         let key = format!("vector_index_rebuild:{table}");
 
@@ -3008,7 +3000,7 @@ impl SqlMemoryStore {
         .bind(&key)
         .bind(row_count as i32) // 复用 failure_count 字段存行数
         .bind(cooldown_until)
-        .execute(&mut *conn)
+        .execute(&self.pool)
         .await
         .map_err(db_err)?;
 
@@ -3021,7 +3013,6 @@ impl SqlMemoryStore {
         &self,
         table: &str,
     ) -> Result<i64, MemoriaError> {
-        let mut conn = self.conn().await?;
         Self::validate_table_name(table)?;
         let key = format!("vector_index_rebuild:{table}");
 
@@ -3031,7 +3022,7 @@ impl SqlMemoryStore {
              WHERE strategy_key = ? AND task = 'rebuild' AND failure_count < 0",
         )
         .bind(&key)
-        .fetch_optional(&mut *conn)
+        .fetch_optional(&self.pool)
         .await
         .map_err(db_err)?;
 
@@ -3059,7 +3050,7 @@ impl SqlMemoryStore {
         .bind(&key)
         .bind(-(failure_count as i32)) // 负数表示失败次数
         .bind(cooldown_until)
-        .execute(&mut *conn)
+        .execute(&self.pool)
         .await
         .map_err(db_err)?;
 
@@ -3068,7 +3059,6 @@ impl SqlMemoryStore {
 
     /// Try to acquire a distributed lock (returns true if acquired).
     pub async fn try_acquire_lock(&self, key: &str, ttl_secs: i64) -> Result<bool, MemoriaError> {
-        let mut conn = self.conn().await?;
         let expires_at = chrono::Utc::now().naive_utc() + chrono::Duration::seconds(ttl_secs);
 
         // 方案1：尝试更新过期的锁
@@ -3080,7 +3070,7 @@ impl SqlMemoryStore {
         .bind(&self.instance_id)
         .bind(expires_at)
         .bind(key)
-        .execute(&mut *conn)
+        .execute(&self.pool)
         .await
         .map_err(db_err)?;
 
@@ -3096,7 +3086,7 @@ impl SqlMemoryStore {
         .bind(key)
         .bind(&self.instance_id)
         .bind(expires_at)
-        .execute(&mut *conn)
+        .execute(&self.pool)
         .await;
 
         match insert_result {
@@ -3113,7 +3103,7 @@ impl SqlMemoryStore {
                          WHERE lock_key = ? AND expires_at >= NOW()",
                     )
                     .bind(key)
-                    .fetch_one(&mut *conn)
+                    .fetch_one(&self.pool)
                     .await
                     .map_err(db_err)?;
                     if exists.0 > 0 {
@@ -3127,7 +3117,7 @@ impl SqlMemoryStore {
                     .bind(key)
                     .bind(&self.instance_id)
                     .bind(expires_at)
-                    .execute(&mut *conn)
+                    .execute(&self.pool)
                     .await;
                     match retry {
                         Ok(_) => Ok(true),
@@ -3169,7 +3159,6 @@ impl SqlMemoryStore {
         signal: &str,
         context: Option<&str>,
     ) -> Result<String, MemoriaError> {
-        let mut conn = self.conn().await?;
         // Validate signal
         if !["useful", "irrelevant", "outdated", "wrong"].contains(&signal) {
             return Err(MemoriaError::Validation(format!(
@@ -3183,7 +3172,7 @@ impl SqlMemoryStore {
         )
         .bind(memory_id)
         .bind(user_id)
-        .fetch_one(&mut *conn)
+        .fetch_one(&self.pool)
         .await
         .map_err(db_err)?;
         if count == 0 {
@@ -3203,7 +3192,7 @@ impl SqlMemoryStore {
         .bind(memory_id)
         .bind(signal)
         .bind(context)
-        .execute(&mut *conn)
+        .execute(&self.pool)
         .await
         .map_err(db_err)?;
 
@@ -3221,7 +3210,7 @@ impl SqlMemoryStore {
         );
         sqlx::query(&sql)
             .bind(memory_id)
-            .execute(&mut *conn)
+            .execute(&self.pool)
             .await
             .map_err(db_err)?;
 
@@ -3493,7 +3482,6 @@ impl SqlMemoryStore {
         user_id: &str,
         since_hours: i64,
     ) -> Result<bool, MemoriaError> {
-        let mut conn = self.conn().await?;
         let row: (i64, Option<i64>) = sqlx::query_as(
             "SELECT COUNT(*) as total_changes, \
              SUM(CASE WHEN superseded_by IS NOT NULL AND superseded_by != '' THEN 1 ELSE 0 END) as supersedes \
@@ -3502,7 +3490,7 @@ impl SqlMemoryStore {
         )
         .bind(user_id)
         .bind(since_hours)
-        .fetch_one(&mut *conn)
+        .fetch_one(&self.pool)
         .await
         .map_err(db_err)?;
         let (total, supersedes) = row;
@@ -3514,14 +3502,13 @@ impl SqlMemoryStore {
 
     /// Hygiene diagnostics: orphan counts and stale data that governance can clean.
     pub async fn health_hygiene(&self, user_id: &str) -> Result<serde_json::Value, MemoriaError> {
-        let mut conn = self.conn().await?;
         let (inactive,): (i64,) = sqlx::query_as(
             "SELECT COUNT(*) FROM mem_memories WHERE user_id = ? AND is_active = 0 \
              AND (superseded_by IS NULL OR superseded_by = '') \
              AND updated_at < DATE_SUB(NOW(), INTERVAL 24 HOUR)",
         )
         .bind(user_id)
-        .fetch_one(&mut *conn)
+        .fetch_one(&self.pool)
         .await
         .map_err(db_err)?;
 
@@ -3530,7 +3517,7 @@ impl SqlMemoryStore {
              AND is_active = 1 AND TIMESTAMPDIFF(HOUR, observed_at, NOW()) > 24",
         )
         .bind(user_id)
-        .fetch_one(&mut *conn)
+        .fetch_one(&self.pool)
         .await
         .map_err(db_err)?;
 
@@ -3540,7 +3527,7 @@ impl SqlMemoryStore {
              WHERE l.user_id = ? AND m.memory_id IS NULL",
         )
         .bind(user_id)
-        .fetch_one(&mut *conn)
+        .fetch_one(&self.pool)
         .await
         .map_err(db_err)?;
 
@@ -3550,7 +3537,7 @@ impl SqlMemoryStore {
              WHERE l.user_id = ? AND m.memory_id IS NULL",
         )
         .bind(user_id)
-        .fetch_one(&mut *conn)
+        .fetch_one(&self.pool)
         .await
         .map_err(db_err)?;
 
@@ -3561,7 +3548,7 @@ impl SqlMemoryStore {
                AND (m.is_active = 0 OR m.memory_id IS NULL)",
         )
         .bind(user_id)
-        .fetch_one(&mut *conn)
+        .fetch_one(&self.pool)
         .await
         .map_err(db_err)?;
 
@@ -3576,13 +3563,12 @@ impl SqlMemoryStore {
 
     /// Global hygiene diagnostics (admin).
     pub async fn health_hygiene_global(&self) -> Result<serde_json::Value, MemoriaError> {
-        let mut conn = self.conn().await?;
         let (inactive,): (i64,) = sqlx::query_as(
             "SELECT COUNT(*) FROM mem_memories WHERE is_active = 0 \
              AND (superseded_by IS NULL OR superseded_by = '') \
              AND updated_at < DATE_SUB(NOW(), INTERVAL 24 HOUR)",
         )
-        .fetch_one(&mut *conn)
+        .fetch_one(&self.pool)
         .await
         .map_err(db_err)?;
 
@@ -3590,7 +3576,7 @@ impl SqlMemoryStore {
             "SELECT COUNT(*) FROM mem_memories WHERE memory_type = 'working' \
              AND is_active = 1 AND TIMESTAMPDIFF(HOUR, observed_at, NOW()) > 24",
         )
-        .fetch_one(&mut *conn)
+        .fetch_one(&self.pool)
         .await
         .map_err(db_err)?;
 
@@ -3599,7 +3585,7 @@ impl SqlMemoryStore {
              LEFT JOIN mem_memories m ON l.memory_id = m.memory_id AND m.is_active = 1 \
              WHERE m.memory_id IS NULL",
         )
-        .fetch_one(&mut *conn)
+        .fetch_one(&self.pool)
         .await
         .map_err(db_err)?;
 
@@ -3608,7 +3594,7 @@ impl SqlMemoryStore {
              LEFT JOIN mem_memories m ON l.memory_id = m.memory_id AND m.is_active = 1 \
              WHERE m.memory_id IS NULL",
         )
-        .fetch_one(&mut *conn)
+        .fetch_one(&self.pool)
         .await
         .map_err(db_err)?;
 
@@ -3618,7 +3604,7 @@ impl SqlMemoryStore {
              WHERE g.is_active = 1 AND g.memory_id IS NOT NULL \
                AND (m.is_active = 0 OR m.memory_id IS NULL)",
         )
-        .fetch_one(&mut *conn)
+        .fetch_one(&self.pool)
         .await
         .map_err(db_err)?;
 
@@ -3627,7 +3613,7 @@ impl SqlMemoryStore {
              LEFT JOIN mem_memories m ON s.memory_id = m.memory_id \
              WHERE m.memory_id IS NULL",
         )
-        .fetch_one(&mut *conn)
+        .fetch_one(&self.pool)
         .await
         .map_err(db_err)?;
 
@@ -3643,7 +3629,6 @@ impl SqlMemoryStore {
 
     /// Per-type stats: count, avg_confidence, contradiction_rate, avg_staleness_hours.
     pub async fn health_analyze(&self, user_id: &str) -> Result<serde_json::Value, MemoriaError> {
-        let mut conn = self.conn().await?;
         let rows: Vec<(String, i64, f64, i64, f64)> = sqlx::query_as(
             "SELECT memory_type, COUNT(*) as total, AVG(initial_confidence) as avg_conf, \
              COUNT(CASE WHEN superseded_by IS NOT NULL AND superseded_by != '' THEN 1 END) as superseded, \
@@ -3651,7 +3636,7 @@ impl SqlMemoryStore {
              FROM mem_memories WHERE user_id = ? GROUP BY memory_type",
         )
         .bind(user_id)
-        .fetch_all(&mut *conn)
+        .fetch_all(&self.pool)
         .await
         .map_err(db_err)?;
 
@@ -3680,7 +3665,6 @@ impl SqlMemoryStore {
         &self,
         user_id: &str,
     ) -> Result<serde_json::Value, MemoriaError> {
-        let mut conn = self.conn().await?;
         let row: (i64, i64, f64) = sqlx::query_as(
             "SELECT COUNT(*) as total, \
              SUM(CASE WHEN is_active = 1 THEN 1 ELSE 0 END) as active, \
@@ -3688,7 +3672,7 @@ impl SqlMemoryStore {
              FROM mem_memories WHERE user_id = ?",
         )
         .bind(user_id)
-        .fetch_one(&mut *conn)
+        .fetch_one(&self.pool)
         .await
         .map_err(db_err)?;
 
@@ -3702,26 +3686,25 @@ impl SqlMemoryStore {
 
     /// IVF capacity estimate: global vector count + growth rate + recommendation.
     pub async fn health_capacity(&self, user_id: &str) -> Result<serde_json::Value, MemoriaError> {
-        let mut conn = self.conn().await?;
         const IVF_OPTIMAL: i64 = 50_000;
         const IVF_DEGRADED: i64 = 200_000;
 
         let (user_active,): (i64,) =
             sqlx::query_as("SELECT COUNT(*) FROM mem_memories WHERE user_id = ? AND is_active = 1")
                 .bind(user_id)
-                .fetch_one(&mut *conn)
+                .fetch_one(&self.pool)
                 .await
                 .map_err(db_err)?;
 
         let (global_total,): (i64,) =
             sqlx::query_as("SELECT COUNT(*) FROM mem_memories WHERE is_active = 1")
-                .fetch_one(&mut *conn)
+                .fetch_one(&self.pool)
                 .await
                 .map_err(db_err)?;
 
         let (added_30d,): (i64,) = sqlx::query_as(
             "SELECT COUNT(*) FROM mem_memories WHERE user_id = ? AND observed_at >= NOW() - INTERVAL 30 DAY"
-        ).bind(user_id).fetch_one(&mut *conn).await.map_err(db_err)?;
+        ).bind(user_id).fetch_one(&self.pool).await.map_err(db_err)?;
 
         let recommendation = if global_total > IVF_DEGRADED {
             "partition_required"
@@ -3866,7 +3849,7 @@ impl SqlMemoryStore {
 
     /// Batch cleanup entity data for multiple memory IDs.
     pub async fn cleanup_entity_data_batch(&self, ids: &[String]) {
-        let mut conn = match self.conn().await {
+        let mut conn = match self.pool.acquire().await {
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!("failed to acquire connection: {e}");
@@ -3885,7 +3868,7 @@ impl SqlMemoryStore {
             for id in chunk {
                 q = q.bind(id);
             }
-            if let Err(e) = q.execute(&mut *conn).await {
+            if let Err(e) = q.execute(&self.pool).await {
                 tracing::warn!("batch deactivate graph nodes failed: {e}");
             }
 
@@ -3906,7 +3889,7 @@ impl SqlMemoryStore {
             for id in chunk {
                 q = q.bind(id);
             }
-            if let Err(e) = q.execute(&mut *conn).await {
+            if let Err(e) = q.execute(&self.pool).await {
                 tracing::warn!("batch delete entity_links failed: {e}");
             }
         }
@@ -4139,7 +4122,6 @@ impl SqlMemoryStore {
         user_id: &str,
         topic: &str,
     ) -> Result<Vec<String>, MemoriaError> {
-        let mut conn = self.conn().await?;
         // Require minimum length to avoid full table scan
         if topic.trim().len() < 3 {
             return Err(MemoriaError::Validation(
@@ -4166,7 +4148,7 @@ impl SqlMemoryStore {
             let rows: Vec<(String,)> = sqlx::query_as(&sql)
                 .bind(user_id)
                 .bind(&like_pat)
-                .fetch_all(&mut *conn)
+                .fetch_all(&self.pool)
                 .await
                 .map_err(db_err)?;
             if !rows.is_empty() {
@@ -4182,7 +4164,7 @@ impl SqlMemoryStore {
         let rows: Vec<(String,)> = sqlx::query_as(&sql)
             .bind(user_id)
             .bind(&like_pat)
-            .fetch_all(&mut *conn)
+            .fetch_all(&self.pool)
             .await
             .map_err(db_err)?;
         Ok(rows.into_iter().map(|r| r.0).collect())
@@ -4512,7 +4494,6 @@ impl SqlMemoryStore {
         memory_id: &str,
         entities: &[(String, String)], // (name, type)
     ) -> Result<(usize, usize), MemoriaError> {
-        let mut conn = self.conn().await?;
         if entities.is_empty() {
             return Ok((0, 0));
         }
@@ -4523,7 +4504,7 @@ impl SqlMemoryStore {
             )
             .bind(user_id)
             .bind(memory_id)
-            .fetch_all(&mut *conn)
+            .fetch_all(&self.pool)
             .await
             .map_err(db_err)?;
             rows.iter()
@@ -4568,7 +4549,7 @@ impl SqlMemoryStore {
                     .bind(*etype)
                     .bind(now);
             }
-            q.execute(&mut *conn).await.map_err(db_err)?;
+            q.execute(&self.pool).await.map_err(db_err)?;
         }
         Ok((to_insert.len(), reused))
     }
