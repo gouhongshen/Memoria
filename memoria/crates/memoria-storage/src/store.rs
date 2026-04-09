@@ -713,6 +713,25 @@ impl SqlMemoryStore {
         }
     }
 
+    /// Auto-qualify all known per-user table names in a SQL string.
+    pub fn tq(&self, sql: &str) -> String {
+        let Some(db) = &self.db_name else { return sql.to_string() };
+        let prefix = format!("`{}`.", db.replace('`', "``"));
+        let mut s = sql.to_string();
+        for table in &[
+            "mem_memory_entity_links", "mem_governance_runtime_state",
+            "mem_governance_cooldown", "mem_user_retrieval_params",
+            "mem_distributed_locks", "mem_retrieval_feedback",
+            "mem_memories_stats", "mem_entity_links", "mem_async_tasks",
+            "memory_graph_nodes", "memory_graph_edges", "mem_schema_meta",
+            "mem_tool_usage", "mem_edit_log", "mem_user_state",
+            "mem_branches", "mem_snapshots", "mem_memories",
+        ] {
+            s = s.replace(table, &format!("{prefix}{table}"));
+        }
+        s
+    }
+
     pub fn set_db_router(&mut self, router: Arc<DbRouter>) {
         self.db_router = Some(router);
     }
@@ -1113,255 +1132,99 @@ impl SqlMemoryStore {
     }
 
     async fn apply_user_compat_migrations(&self, pool: &MySqlPool) -> Result<(), MemoriaError> {
-        let _ = sqlx::query(
-            "ALTER TABLE mem_memories_stats ADD COLUMN feedback_useful INT NOT NULL DEFAULT 0",
-        )
-        .execute(pool)
-        .await;
-        let _ = sqlx::query(
-            "ALTER TABLE mem_memories_stats ADD COLUMN feedback_irrelevant INT NOT NULL DEFAULT 0",
-        )
-        .execute(pool)
-        .await;
-        let _ = sqlx::query(
-            "ALTER TABLE mem_memories_stats ADD COLUMN feedback_outdated INT NOT NULL DEFAULT 0",
-        )
-        .execute(pool)
-        .await;
-        let _ = sqlx::query(
-            "ALTER TABLE mem_memories_stats ADD COLUMN feedback_wrong INT NOT NULL DEFAULT 0",
-        )
-        .execute(pool)
-        .await;
-        let _ =
-            sqlx::query("ALTER TABLE mem_memories_stats ADD COLUMN last_feedback_at DATETIME(6)")
-                .execute(pool)
-                .await;
+        let db = self.db_name.as_deref().unwrap_or("");
 
-        let _ =
-            sqlx::query("ALTER TABLE mem_edit_log ADD COLUMN memory_id VARCHAR(64) DEFAULT NULL")
-                .execute(pool)
-                .await;
-        let _ = sqlx::query("ALTER TABLE mem_edit_log ADD COLUMN payload JSON DEFAULT NULL")
-            .execute(pool)
-            .await;
+        // Batch 1: fire-and-forget ALTER TABLE ADD COLUMN (parallel, ignore if exists)
+        let s1 = self.tq("ALTER TABLE mem_memories_stats ADD COLUMN feedback_useful INT NOT NULL DEFAULT 0");
+        let s2 = self.tq("ALTER TABLE mem_memories_stats ADD COLUMN feedback_irrelevant INT NOT NULL DEFAULT 0");
+        let s3 = self.tq("ALTER TABLE mem_memories_stats ADD COLUMN feedback_outdated INT NOT NULL DEFAULT 0");
+        let s4 = self.tq("ALTER TABLE mem_memories_stats ADD COLUMN feedback_wrong INT NOT NULL DEFAULT 0");
+        let s5 = self.tq("ALTER TABLE mem_memories_stats ADD COLUMN last_feedback_at DATETIME(6)");
+        let s6 = self.tq("ALTER TABLE mem_edit_log ADD COLUMN memory_id VARCHAR(64) DEFAULT NULL");
+        let s7 = self.tq("ALTER TABLE mem_edit_log ADD COLUMN payload JSON DEFAULT NULL");
+        let s8 = self.tq("ALTER TABLE mem_memories ADD COLUMN extra_metadata JSON AFTER source_event_ids");
+        let (_, _, _, _, _, _, _, _) = tokio::join!(
+            sqlx::query(&s1).execute(pool), sqlx::query(&s2).execute(pool),
+            sqlx::query(&s3).execute(pool), sqlx::query(&s4).execute(pool),
+            sqlx::query(&s5).execute(pool), sqlx::query(&s6).execute(pool),
+            sqlx::query(&s7).execute(pool), sqlx::query(&s8).execute(pool),
+        );
 
-        let _ = sqlx::query(
-            "ALTER TABLE mem_memories ADD COLUMN extra_metadata JSON AFTER source_event_ids",
-        )
-        .execute(pool)
-        .await;
+        // Batch 2: information_schema checks (parallel, use explicit db name)
+        let q1 = format!("SELECT COUNT(*) = 0 FROM information_schema.statistics WHERE table_schema = '{db}' AND table_name = 'mem_memories' AND index_name = 'idx_user_active' AND column_name = 'memory_type'");
+        let q2 = format!("SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = '{db}' AND table_name = 'mem_branches' AND column_name = 'table_name'");
+        let q3 = format!("SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = '{db}' AND table_name = 'mem_branches' AND column_name = 'id'");
+        let q4 = format!("SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = '{db}' AND table_name = 'mem_api_call_log' AND column_name = 'method'");
+        let q5 = format!("SELECT COUNT(*) FROM information_schema.statistics WHERE table_schema = '{db}' AND table_name = 'mem_retrieval_feedback' AND index_name = 'idx_feedback_memory_user'");
+        let q6 = format!("SELECT COUNT(*) FROM information_schema.statistics WHERE table_schema = '{db}' AND table_name = 'mem_retrieval_feedback' AND index_name = 'idx_feedback_created_at'");
+        let q7 = format!("SELECT COUNT(*) FROM information_schema.statistics WHERE table_schema = '{db}' AND table_name = 'mem_memories' AND index_name = 'idx_memories_user_observed'");
+        let q8 = format!("SELECT COUNT(*) FROM information_schema.statistics WHERE table_schema = '{db}' AND table_name = 'mem_memories' AND index_name = 'idx_user_active_created'");
+        let q9 = self.tq("SELECT COUNT(*) FROM mem_memories WHERE superseded_by = ''");
+        let (needs_idx_upgrade, has_table_name, has_id, has_method_col,
+             has_fb_mem_idx, has_fb_created_idx, has_mem_observed_idx, has_active_created_idx,
+             has_empty_superseded) = tokio::join!(
+            async { sqlx::query_scalar::<_, bool>(&q1).fetch_one(pool).await.unwrap_or(false) },
+            query_has_rows(pool, &q2), query_has_rows(pool, &q3), query_has_rows(pool, &q4),
+            query_has_rows(pool, &q5), query_has_rows(pool, &q6), query_has_rows(pool, &q7),
+            query_has_rows(pool, &q8), query_has_rows(pool, &q9),
+        );
 
-        let needs_upgrade: bool = sqlx::query_scalar(
-            "SELECT COUNT(*) = 0 FROM information_schema.statistics \
-             WHERE table_schema = DATABASE() AND table_name = 'mem_memories' \
-             AND index_name = 'idx_user_active' AND column_name = 'memory_type'",
-        )
-        .fetch_one(pool)
-        .await
-        .unwrap_or(false);
-        if needs_upgrade {
-            let _ = sqlx::query("ALTER TABLE mem_memories DROP INDEX idx_user_active")
-                .execute(pool)
-                .await;
-            let _ = sqlx::query(
-                "ALTER TABLE mem_memories ADD INDEX idx_user_active (user_id, is_active, memory_type)",
-            )
-            .execute(pool)
-            .await;
+        // Batch 3: conditional DDL (most are no-ops for existing users)
+        if needs_idx_upgrade {
+            let _ = sqlx::query(&self.tq("ALTER TABLE mem_memories DROP INDEX idx_user_active")).execute(pool).await;
+            let _ = sqlx::query(&self.tq("ALTER TABLE mem_memories ADD INDEX idx_user_active (user_id, is_active, memory_type)")).execute(pool).await;
         }
-
-        let has_table_name = query_has_rows(
-            pool,
-            "SELECT COUNT(*) FROM information_schema.columns \
-             WHERE table_schema = DATABASE() AND table_name = 'mem_branches' AND column_name = 'table_name'",
-        )
-        .await;
         if !has_table_name {
-            let _ = sqlx::query(
-                "ALTER TABLE mem_branches ADD COLUMN table_name VARCHAR(100) NOT NULL DEFAULT ''",
-            )
-            .execute(pool)
-            .await;
+            let _ = sqlx::query(&self.tq("ALTER TABLE mem_branches ADD COLUMN table_name VARCHAR(100) NOT NULL DEFAULT ''")).execute(pool).await;
         }
-
-        let has_id = query_has_rows(
-            pool,
-            "SELECT COUNT(*) FROM information_schema.columns \
-             WHERE table_schema = DATABASE() AND table_name = 'mem_branches' AND column_name = 'id'",
-        )
-        .await;
         if !has_id {
-            let _ = sqlx::query("DROP TABLE IF EXISTS mem_branches")
-                .execute(pool)
-                .await;
-            sqlx::query(
-                r#"CREATE TABLE IF NOT EXISTS mem_branches (
-                    id          VARCHAR(64)  PRIMARY KEY,
-                    user_id     VARCHAR(64)  NOT NULL,
-                    name        VARCHAR(100) NOT NULL,
-                    table_name  VARCHAR(100) NOT NULL,
-                    status      VARCHAR(20)  NOT NULL DEFAULT 'active',
-                    created_at  DATETIME(6)  NOT NULL,
-                    INDEX idx_user_name (user_id, name)
-                )"#,
-            )
-            .execute(pool)
-            .await
-            .map_err(db_err)?;
+            let _ = sqlx::query(&self.tq("DROP TABLE IF EXISTS mem_branches")).execute(pool).await;
+            sqlx::query(&format!(
+                "CREATE TABLE IF NOT EXISTS {} (
+                    id VARCHAR(64) PRIMARY KEY, user_id VARCHAR(64) NOT NULL,
+                    name VARCHAR(100) NOT NULL, table_name VARCHAR(100) NOT NULL,
+                    status VARCHAR(20) NOT NULL DEFAULT 'active', created_at DATETIME(6) NOT NULL,
+                    INDEX idx_user_name (user_id, name))", self.t("mem_branches")
+            )).execute(pool).await.map_err(db_err)?;
         }
-
-        let has_method_col = query_has_rows(
-            pool,
-            "SELECT COUNT(*) FROM information_schema.columns \
-             WHERE table_schema = DATABASE() AND table_name = 'mem_api_call_log' \
-             AND column_name = 'method'",
-        )
-        .await;
         if !has_method_col {
-            let _ = sqlx::query(
-                "ALTER TABLE mem_api_call_log ADD COLUMN method VARCHAR(10) NOT NULL DEFAULT ''",
-            )
-            .execute(pool)
-            .await;
+            let _ = sqlx::query(&self.tq("ALTER TABLE mem_api_call_log ADD COLUMN method VARCHAR(10) NOT NULL DEFAULT ''")).execute(pool).await;
+        }
+        let r = sqlx::query(&self.tq("ALTER TABLE mem_api_call_log ADD COLUMN rpc_success TINYINT(1) NOT NULL DEFAULT 1")).execute(pool).await;
+        if let Err(e) = r { if !is_duplicate_column(&e) { return Err(db_err(e)); } }
+        let r = sqlx::query(&self.tq("ALTER TABLE mem_api_call_log ADD COLUMN rpc_error_code INT NULL")).execute(pool).await;
+        if let Err(e) = r { if !is_duplicate_column(&e) { return Err(db_err(e)); } }
+        if !has_fb_mem_idx {
+            let _ = sqlx::query(&self.tq("ALTER TABLE mem_retrieval_feedback ADD INDEX idx_feedback_memory_user (user_id, memory_id)")).execute(pool).await;
+        }
+        if !has_fb_created_idx {
+            let _ = sqlx::query(&self.tq("ALTER TABLE mem_retrieval_feedback ADD INDEX idx_feedback_created_at (created_at)")).execute(pool).await;
+        }
+        if !has_mem_observed_idx {
+            let _ = sqlx::query(&self.tq("ALTER TABLE mem_memories ADD INDEX idx_memories_user_observed (user_id, observed_at)")).execute(pool).await;
+        }
+        if has_active_created_idx {
+            let _ = sqlx::query(&self.tq("ALTER TABLE mem_memories DROP INDEX idx_user_active_created")).execute(pool).await;
         }
 
-        let add_rpc_success = sqlx::query(
-            "ALTER TABLE mem_api_call_log \
-             ADD COLUMN rpc_success TINYINT(1) NOT NULL DEFAULT 1",
-        )
-        .execute(pool)
-        .await;
-        if let Err(e) = add_rpc_success {
-            if !is_duplicate_column(&e) {
-                tracing::error!(
-                    error = %e,
-                    "Migration fatal: mem_api_call_log.rpc_success could not be added. \
-                     The call-log writer always inserts this column; without it ALL \
-                     call-log flushes will fail with 'unknown column', silently dropping \
-                     every /v1/* and /mcp monitoring entry. \
-                     Fix DB permissions or add the column manually, then restart."
-                );
-                return Err(db_err(e));
-            }
-        }
-
-        let add_rpc_error_code = sqlx::query(
-            "ALTER TABLE mem_api_call_log \
-             ADD COLUMN rpc_error_code INT NULL",
-        )
-        .execute(pool)
-        .await;
-        if let Err(e) = add_rpc_error_code {
-            if !is_duplicate_column(&e) {
-                tracing::error!(
-                    error = %e,
-                    "Migration fatal: mem_api_call_log.rpc_error_code could not be added. \
-                     The call-log writer always inserts this column; without it ALL \
-                     call-log flushes will fail with 'unknown column'. \
-                     Fix DB permissions or add the column manually, then restart."
-                );
-                return Err(db_err(e));
-            }
-        }
-
-        let has_feedback_memory_user_idx = query_has_rows(
-            pool,
-            "SELECT COUNT(*) FROM information_schema.statistics \
-             WHERE table_schema = DATABASE() \
-               AND table_name = 'mem_retrieval_feedback' \
-               AND index_name = 'idx_feedback_memory_user'",
-        )
-        .await;
-        if !has_feedback_memory_user_idx {
-            let _ = sqlx::query(
-                "ALTER TABLE mem_retrieval_feedback \
-                 ADD INDEX idx_feedback_memory_user (user_id, memory_id)",
-            )
-            .execute(pool)
-            .await;
-        }
-
-        let has_feedback_created_at_idx = query_has_rows(
-            pool,
-            "SELECT COUNT(*) FROM information_schema.statistics \
-             WHERE table_schema = DATABASE() \
-               AND table_name = 'mem_retrieval_feedback' \
-               AND index_name = 'idx_feedback_created_at'",
-        )
-        .await;
-        if !has_feedback_created_at_idx {
-            let _ = sqlx::query(
-                "ALTER TABLE mem_retrieval_feedback \
-                 ADD INDEX idx_feedback_created_at (created_at)",
-            )
-            .execute(pool)
-            .await;
-        }
-
-        let has_memories_user_observed_idx = query_has_rows(
-            pool,
-            "SELECT COUNT(*) FROM information_schema.statistics \
-             WHERE table_schema = DATABASE() \
-               AND table_name = 'mem_memories' \
-               AND index_name = 'idx_memories_user_observed'",
-        )
-        .await;
-        if !has_memories_user_observed_idx {
-            let _ = sqlx::query(
-                "ALTER TABLE mem_memories \
-                 ADD INDEX idx_memories_user_observed (user_id, observed_at)",
-            )
-            .execute(pool)
-            .await;
-        }
-
-        let has_user_active_created_idx = query_has_rows(
-            pool,
-            "SELECT COUNT(*) FROM information_schema.statistics \
-             WHERE table_schema = DATABASE() \
-               AND table_name = 'mem_memories' \
-               AND index_name = 'idx_user_active_created'",
-        )
-        .await;
-        if has_user_active_created_idx {
-            let _ = sqlx::query("ALTER TABLE mem_memories DROP INDEX idx_user_active_created")
-                .execute(pool)
-                .await;
-        }
-
-        let has_empty_superseded = query_has_rows(
-            pool,
-            "SELECT COUNT(*) FROM mem_memories WHERE superseded_by = ''",
-        )
-        .await;
         if has_empty_superseded {
-            for (tbl, col) in [
-                ("mem_memories", "superseded_by"),
-                ("mem_memories", "session_id"),
-                ("memory_graph_nodes", "superseded_by"),
-                ("memory_graph_nodes", "session_id"),
-                ("memory_graph_nodes", "memory_id"),
-                ("memory_graph_nodes", "entity_type"),
-                ("memory_graph_nodes", "conflicts_with"),
-                ("memory_graph_nodes", "conflict_resolution"),
-            ] {
-                if let Err(e) =
-                    sqlx::query(&format!("UPDATE {tbl} SET {col} = NULL WHERE {col} = ''"))
-                        .execute(pool)
-                        .await
-                {
-                    tracing::warn!(table = tbl, column = col, error = %e, "MO#24001 migration: failed to normalize empty strings");
-                }
-            }
+            let sqls: Vec<String> = [
+                "UPDATE mem_memories SET superseded_by = NULL WHERE superseded_by = ''",
+                "UPDATE mem_memories SET session_id = NULL WHERE session_id = ''",
+                "UPDATE memory_graph_nodes SET superseded_by = NULL WHERE superseded_by = ''",
+                "UPDATE memory_graph_nodes SET session_id = NULL WHERE session_id = ''",
+                "UPDATE memory_graph_nodes SET memory_id = NULL WHERE memory_id = ''",
+                "UPDATE memory_graph_nodes SET entity_type = NULL WHERE entity_type = ''",
+                "UPDATE memory_graph_nodes SET conflicts_with = NULL WHERE conflicts_with = ''",
+                "UPDATE memory_graph_nodes SET conflict_resolution = NULL WHERE conflict_resolution = ''",
+            ].iter().map(|s| self.tq(s)).collect();
+            let futs: Vec<_> = sqls.iter().map(|sql| sqlx::query(sql).execute(pool)).collect();
+            futures::future::join_all(futs).await;
         }
 
-        let _ = sqlx::raw_sql(
-            "UPDATE mem_memories SET embedding = NULL \
-             WHERE embedding IS NOT NULL AND vector_dims(embedding) = 0",
-        )
-        .execute(pool)
-        .await;
+        let _ = sqlx::query(&self.tq(
+            "UPDATE mem_memories SET embedding = NULL WHERE embedding IS NOT NULL AND vector_dims(embedding) = 0"
+        )).execute(pool).await;
 
         Ok(())
     }
