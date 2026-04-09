@@ -2152,17 +2152,16 @@ impl SqlMemoryStore {
     }
 
     pub async fn set_cooldown(&self, user_id: &str, operation: &str) -> Result<(), MemoriaError> {
-        let mut conn = self.conn().await?;
         let now = Utc::now().naive_utc();
-        sqlx::query(
+        sqlx::query(&self.tq(
             "INSERT INTO mem_governance_cooldown (user_id, operation, last_run_at) \
              VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE last_run_at = ?",
-        )
+        ))
         .bind(user_id)
         .bind(operation)
         .bind(now)
         .bind(now)
-        .execute(&mut *conn)
+        .execute(&self.pool)
         .await
         .map_err(db_err)?;
         let key = format!("{}:{}", user_id, operation);
@@ -2175,16 +2174,15 @@ impl SqlMemoryStore {
         strategy_key: &str,
         task: &str,
     ) -> Result<Option<i64>, MemoriaError> {
-        let mut conn = self.conn().await?;
-        let row = sqlx::query(
+        let row = sqlx::query(&self.tq(
             "SELECT TIMESTAMPDIFF(SECOND, NOW(), circuit_open_until) AS remaining \
              FROM mem_governance_runtime_state \
              WHERE strategy_key = ? AND task = ? \
                AND circuit_open_until IS NOT NULL AND circuit_open_until > NOW()",
-        )
+        ))
         .bind(strategy_key)
         .bind(task)
-        .fetch_optional(&mut *conn)
+        .fetch_optional(&self.pool)
         .await
         .map_err(db_err)?;
 
@@ -2198,10 +2196,9 @@ impl SqlMemoryStore {
         threshold: usize,
         cooldown_secs: i64,
     ) -> Result<Option<i64>, MemoriaError> {
-        let mut conn = self.conn().await?;
         let open_on_insert = threshold <= 1;
         let initial_failures = if open_on_insert { 0 } else { 1 };
-        sqlx::query(
+        sqlx::query(&self.tq(
             "INSERT INTO mem_governance_runtime_state \
                  (strategy_key, task, failure_count, circuit_open_until, updated_at) \
              VALUES (?, ?, ?, CASE WHEN ? THEN DATE_ADD(NOW(), INTERVAL ? SECOND) ELSE NULL END, NOW()) \
@@ -2217,7 +2214,7 @@ impl SqlMemoryStore {
                      ELSE NULL \
                  END, \
                  updated_at = NOW()"
-        )
+        ))
         .bind(strategy_key)
         .bind(task)
         .bind(initial_failures)
@@ -2226,7 +2223,7 @@ impl SqlMemoryStore {
         .bind(threshold as i64)
         .bind(threshold as i64)
         .bind(cooldown_secs)
-        .execute(&mut *conn)
+        .execute(&self.pool)
         .await
         .map_err(db_err)?;
 
@@ -2239,16 +2236,15 @@ impl SqlMemoryStore {
         strategy_key: &str,
         task: &str,
     ) -> Result<(), MemoriaError> {
-        let mut conn = self.conn().await?;
-        sqlx::query(
+        sqlx::query(&self.tq(
             "INSERT INTO mem_governance_runtime_state \
                  (strategy_key, task, failure_count, circuit_open_until, updated_at) \
              VALUES (?, ?, 0, NULL, NOW()) \
              ON DUPLICATE KEY UPDATE failure_count = 0, circuit_open_until = NULL, updated_at = NOW()"
-        )
+        ))
         .bind(strategy_key)
         .bind(task)
-        .execute(&mut *conn)
+        .execute(&self.pool)
         .await
         .map_err(db_err)?;
         Ok(())
@@ -2762,15 +2758,14 @@ impl SqlMemoryStore {
 
     /// Reset access_count to 0 for all memories of a user.
     pub async fn reset_access_counts(&self, user_id: &str) -> Result<i64, MemoriaError> {
-        let mut conn = self.conn().await?;
-        let result = sqlx::query(
+        let result = sqlx::query(&self.tq(
             "UPDATE mem_memories_stats s \
              JOIN mem_memories m ON s.memory_id = m.memory_id \
              SET s.access_count = 0 \
              WHERE m.user_id = ?",
-        )
+        ))
         .bind(user_id)
-        .execute(&mut *conn)
+        .execute(&self.pool)
         .await
         .map_err(db_err)?;
         Ok(result.rows_affected() as i64)
@@ -3858,7 +3853,6 @@ impl SqlMemoryStore {
         table: &str,
         ids: &[String],
     ) -> Result<(), MemoriaError> {
-        let mut conn = self.conn().await?;
         for chunk in ids.chunks(200) {
             let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
             let sql = format!(
@@ -3868,7 +3862,7 @@ impl SqlMemoryStore {
             for id in chunk {
                 q = q.bind(id);
             }
-            q.execute(&mut *conn).await.map_err(db_err)?;
+            q.execute(&self.pool).await.map_err(db_err)?;
         }
         Ok(())
     }
