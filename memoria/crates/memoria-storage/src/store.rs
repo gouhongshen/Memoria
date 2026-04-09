@@ -2121,17 +2121,15 @@ impl SqlMemoryStore {
             if elapsed < cooldown_secs {
                 return Ok(Some(cooldown_secs - elapsed));
             }
-            // Expired in memory — can run
             return Ok(None);
         }
-        // Cache miss — check DB (cold start or cross-instance)
-        let row = sqlx::query(
+        let row = sqlx::query(&self.tq(
             "SELECT TIMESTAMPDIFF(SECOND, last_run_at, NOW()) as elapsed \
              FROM mem_governance_cooldown WHERE user_id = ? AND operation = ?",
-        )
+        ))
         .bind(user_id)
         .bind(operation)
-        .fetch_optional(&mut *conn)
+        .fetch_optional(&self.pool)
         .await
         .map_err(db_err)?;
         match row {
