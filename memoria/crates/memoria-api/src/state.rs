@@ -216,6 +216,12 @@ impl AppState {
             acquire_timeout_secs = auth_acquire_timeout.as_secs(),
             "Dedicated auth connection pool initialized"
         );
+
+        // Monitor auth pool health
+        let auth_health = std::sync::Arc::new(std::sync::Mutex::new(
+            memoria_storage::PoolHealthSnapshot::new(Some(auth_max_connections)),
+        ));
+        memoria_storage::spawn_pool_monitor(pool.clone(), Some(auth_max_connections), auth_health);
         // Start the batched last_used_at flusher using the auth pool
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
         let h1 = spawn_last_used_flusher(

@@ -78,6 +78,12 @@ impl DbRouter {
             "Shared routing pool initialized"
         );
 
+        // Monitor shared routing pool health
+        let shared_health = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::store::PoolHealthSnapshot::new(Some(shared_max)),
+        ));
+        crate::store::spawn_pool_monitor(pool.clone(), Some(shared_max), shared_health);
+
         // Global pool for all per-user DB queries.
         // statement_cache_capacity=0 prevents prepared-statement cross-DB pollution.
         let global_max = configured_pool_max_connections(
