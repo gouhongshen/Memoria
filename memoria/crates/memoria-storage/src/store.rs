@@ -417,16 +417,19 @@ pub fn spawn_pool_monitor(
                     }
                 }
                 PoolHealthLevel::Saturated => {
-                    tracing::warn!(
-                        pool_size = size,
-                        pool_active = active,
-                        pool_idle = idle,
-                        configured_max_connections,
-                        state = level.as_str(),
-                        state_duration_secs = guard.since.elapsed().as_secs(),
-                        consecutive_observations = guard.consecutive_observations,
-                        "connection pool saturated — pool is at configured max and all established connections are busy"
-                    );
+                    let duration_secs = guard.since.elapsed().as_secs();
+                    if duration_secs >= 300 {
+                        tracing::warn!(
+                            pool_size = size,
+                            pool_active = active,
+                            pool_idle = idle,
+                            configured_max_connections,
+                            state = level.as_str(),
+                            state_duration_secs = duration_secs,
+                            consecutive_observations = guard.consecutive_observations,
+                            "connection pool saturated — pool is at configured max and all established connections are busy"
+                        );
+                    }
                 }
                 PoolHealthLevel::HighUtilization => {
                     if idle == 0 {
