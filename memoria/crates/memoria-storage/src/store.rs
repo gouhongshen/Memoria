@@ -1367,23 +1367,61 @@ impl SqlMemoryStore {
     }
 
     pub async fn migrate_user(&self) -> Result<(), MemoriaError> {
-        let pool = self.direct_pool().await?;
-        let is_fresh = is_fresh_database(&pool).await?;
+        let pool = &self.pool;
+        let db = self.db_name.as_deref().unwrap_or("");
+        let is_fresh: bool = sqlx::query_scalar(&format!(
+            "SELECT COUNT(*) = 0 FROM information_schema.tables WHERE table_schema = '{db}'"
+        ))
+        .fetch_one(pool).await.unwrap_or(true);
+
         if is_fresh {
-            self.bootstrap_user_schema(&pool).await?;
-            ensure_user_schema_meta_table(&pool).await?;
-            store_user_schema_version(&pool, CURRENT_USER_SCHEMA_VERSION).await?;
+            self.bootstrap_user_schema(pool).await?;
+            self.ensure_schema_meta(pool).await?;
+            self.set_schema_version(pool, CURRENT_USER_SCHEMA_VERSION).await?;
             return Ok(());
         }
 
-        ensure_user_schema_meta_table(&pool).await?;
-        if load_user_schema_version(&pool).await? == Some(CURRENT_USER_SCHEMA_VERSION) {
+        self.ensure_schema_meta(pool).await?;
+        if self.get_schema_version(pool).await? == Some(CURRENT_USER_SCHEMA_VERSION) {
             return Ok(());
         }
 
-        self.bootstrap_user_schema(&pool).await?;
-        self.apply_user_compat_migrations(&pool).await?;
-        store_user_schema_version(&pool, CURRENT_USER_SCHEMA_VERSION).await
+        self.bootstrap_user_schema(pool).await?;
+        self.apply_user_compat_migrations(pool).await?;
+        self.set_schema_version(pool, CURRENT_USER_SCHEMA_VERSION).await
+    }
+
+    async fn ensure_schema_meta(&self, pool: &MySqlPool) -> Result<(), MemoriaError> {
+        let t = self.t("mem_schema_meta");
+        sqlx::query(&format!(
+            "CREATE TABLE IF NOT EXISTS {t} (
+                schema_key VARCHAR(64) PRIMARY KEY,
+                schema_version BIGINT NOT NULL,
+                updated_at DATETIME(6) NOT NULL)"
+        )).execute(pool).await.map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn get_schema_version(&self, pool: &MySqlPool) -> Result<Option<i64>, MemoriaError> {
+        let t = self.t("mem_schema_meta");
+        let row = sqlx::query(&format!(
+            "SELECT schema_version FROM {t} WHERE schema_key = ? LIMIT 1"
+        ))
+        .bind(USER_SCHEMA_META_KEY)
+        .fetch_optional(pool).await.map_err(db_err)?;
+        row.map(|r| r.try_get::<i64, _>("schema_version").map_err(db_err)).transpose()
+    }
+
+    async fn set_schema_version(&self, pool: &MySqlPool, version: i64) -> Result<(), MemoriaError> {
+        let t = self.t("mem_schema_meta");
+        let now = Utc::now().naive_utc();
+        sqlx::query(&format!(
+            "INSERT INTO {t} (schema_key, schema_version, updated_at) VALUES (?, ?, ?)
+             ON DUPLICATE KEY UPDATE schema_version = VALUES(schema_version), updated_at = VALUES(updated_at)"
+        ))
+        .bind(USER_SCHEMA_META_KEY).bind(version).bind(now)
+        .execute(pool).await.map_err(db_err)?;
+        Ok(())
     }
 
     pub async fn migrate_shared(&self) -> Result<(), MemoriaError> {
