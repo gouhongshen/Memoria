@@ -454,12 +454,12 @@ async fn cmd_serve(db_url: Option<String>, port: u16, master_key: String) -> Res
             )
             .await?,
         );
-        let mut store = SqlMemoryStore::connect_shared(
+        let mut store = SqlMemoryStore::from_existing_pool(
+            router.shared_pool().clone(),
             &cfg.shared_db_url,
             cfg.embedding_dim,
             cfg.instance_id.clone(),
-        )
-        .await?;
+        );
         store.migrate_shared().await?;
         store.set_db_router(router.clone());
         (Arc::new(store), Some(router), cfg.shared_db_url.clone())
@@ -625,12 +625,12 @@ async fn cmd_mcp(
             )
             .await?,
         );
-        let mut store = SqlMemoryStore::connect_shared(
+        let mut store = SqlMemoryStore::from_existing_pool(
+            router.shared_pool().clone(),
             &cfg.shared_db_url,
             cfg.embedding_dim,
             cfg.instance_id.clone(),
-        )
-        .await?;
+        );
         store.migrate_shared().await?;
         store.set_db_router(router.clone());
         (Arc::new(store), Some(router), cfg.shared_db_url.clone())

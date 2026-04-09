@@ -98,47 +98,45 @@ impl<'a> ActivationRetriever<'a> {
 
         let (iterations, anchor_k) = task_activation_params(task_type);
 
-        // 1. Dual-trigger anchor selection
+        // 1. Parallel anchor selection + edge check: vector, BM25, entity recall, has_edges
+        let (vector_results, bm25_results, (entity_anchors, entity_memory_ids), has_edges) = tokio::join!(
+            self.store.search_nodes_vector(user_id, query_embedding, anchor_k),
+            self.store.search_nodes_fulltext(user_id, query, anchor_k),
+            self.entity_recall(user_id, query),
+            self.store.has_edges_for_user(user_id),
+        );
+
         let mut anchors: HashMap<String, f32> = HashMap::new();
         let mut anchor_semantic: HashMap<String, f32> = HashMap::new();
 
-        // 1a. Vector anchors
-        let vector_results = self
-            .store
-            .search_nodes_vector(user_id, query_embedding, anchor_k)
-            .await?;
-        for (node, sim) in &vector_results {
+        for (node, sim) in &vector_results? {
             let s = sim.max(0.0);
             anchors.insert(node.node_id.clone(), s);
             anchor_semantic.insert(node.node_id.clone(), s);
         }
-
-        // 1b. BM25 anchors
-        if let Ok(bm25_results) = self
-            .store
-            .search_nodes_fulltext(user_id, query, anchor_k)
-            .await
-        {
-            for (node, _) in &bm25_results {
-                anchors.entry(node.node_id.clone()).or_insert(0.7);
-            }
+        for (node, _) in &bm25_results.unwrap_or_default() {
+            anchors.entry(node.node_id.clone()).or_insert(0.7);
+        }
+        for (nid, weight) in &entity_anchors {
+            anchors.entry(nid.clone()).or_insert(0.8 * weight);
         }
 
         if anchors.is_empty() {
             return Ok(vec![]);
         }
 
-        // 2. Entity recall via NER on query
-        let (entity_anchors, entity_memory_ids) = self.entity_recall(user_id, query).await;
-        for (nid, weight) in &entity_anchors {
-            anchors.entry(nid.clone()).or_insert(0.8 * weight);
-        }
-
         // 3. Spreading activation
-        let mut sa = SpreadingActivation::new(self.store, task_type);
-        sa.set_anchors(anchors.clone());
-        sa.propagate(iterations).await?;
-        let activation_map = sa.get_activated(0.01);
+        // Skip propagation entirely when there are no edges — each iteration
+        // would just query the DB and get empty results, wasting RTTs.
+        let activation_map = if has_edges {
+            let mut sa = SpreadingActivation::new(self.store, task_type);
+            sa.set_anchors(anchors.clone());
+            sa.propagate(iterations).await?;
+            sa.get_activated(0.01)
+        } else {
+            // No edges → activation = anchors (no spreading)
+            anchors.clone()
+        };
 
         // 4. Collect candidate IDs
         let mut candidate_ids: HashSet<String> = anchors.keys().cloned().collect();
@@ -156,11 +154,14 @@ impl<'a> ActivationRetriever<'a> {
             return Ok(vec![]);
         }
 
-        // Add graph nodes for entity-recalled memories
-        for mid in &entity_memory_ids {
-            if let Ok(Some(gnode)) = self.store.get_node_by_memory_id(mid).await {
-                if gnode.is_active {
-                    candidate_ids.insert(gnode.node_id.clone());
+        // Add graph nodes for entity-recalled memories (batch)
+        if !entity_memory_ids.is_empty() {
+            let mids: Vec<&str> = entity_memory_ids.iter().map(|s| s.as_str()).collect();
+            if let Ok(gnodes) = self.store.get_nodes_by_memory_ids(&mids).await {
+                for gnode in gnodes {
+                    if gnode.is_active {
+                        candidate_ids.insert(gnode.node_id.clone());
+                    }
                 }
             }
         }

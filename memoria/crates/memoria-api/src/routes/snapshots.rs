@@ -345,23 +345,26 @@ pub async fn create_snapshot(
     if let Some((display_name, created_at)) =
         parse_created_snapshot_result(body["result"].as_str().unwrap_or_default())
     {
-        body["name"] = json!(display_name.clone());
+        // Build summary directly from the creation result — no need to re-query
+        // visible_snapshots_for_user (which does SHOW SNAPSHOTS + list_registrations again).
+        let sql = user_snapshot_store(&state, &user_id).await?;
+        let table = sql.t("mem_memories");
+        let snap_internal = memoria_mcp::git_tools::snap_internal(
+            sql.database_name().unwrap_or(""),
+            &req.name,
+        );
+        let count_sql = format!(
+            "SELECT COUNT(*) as cnt FROM {table} {{SNAPSHOT = '{snap_internal}'}} WHERE user_id = ? AND is_active > 0"
+        );
+        let memory_count: i64 = sqlx::query_scalar(&count_sql)
+            .bind(&user_id)
+            .fetch_one(sql.pool())
+            .await
+            .unwrap_or(0);
+        body["name"] = json!(display_name);
         body["created_at"] = json!(created_at.clone());
         body["timestamp"] = json!(created_at);
-
-        let sql = user_snapshot_store(&state, &user_id).await?;
-        let snapshots =
-            memoria_mcp::git_tools::visible_snapshots_for_user(&state.service, &user_id)
-                .await
-                .map_err(api_err_typed)?;
-        if let Some(snapshot) = snapshots
-            .iter()
-            .find(|snapshot| snapshot.display_name == display_name)
-        {
-            body = snapshot_summary_value(&sql, &user_id, snapshot).await?;
-            body["description"] = json!(req.description.clone());
-            body["result"] = json!(result.clone());
-        }
+        body["memory_count"] = json!(memory_count);
     }
     Ok((StatusCode::CREATED, Json(body)))
 }

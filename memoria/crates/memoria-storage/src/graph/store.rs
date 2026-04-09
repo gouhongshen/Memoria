@@ -225,6 +225,27 @@ impl GraphStore {
         Ok(row.map(|r| row_to_node_no_emb(&r)))
     }
 
+    /// Batch fetch active nodes by memory_ids.
+    pub async fn get_nodes_by_memory_ids(
+        &self,
+        memory_ids: &[&str],
+    ) -> Result<Vec<GraphNode>, MemoriaError> {
+        if memory_ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let ph = memory_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT {NODE_COLS_NO_EMB} FROM {} WHERE memory_id IN ({ph}) AND is_active = 1",
+            self.t("memory_graph_nodes"),
+        );
+        let mut q = sqlx::query(&sql);
+        for id in memory_ids {
+            q = q.bind(id);
+        }
+        let rows = q.fetch_all(&self.pool).await.map_err(db_err)?;
+        Ok(rows.iter().map(row_to_node_no_emb).collect())
+    }
+
     /// Get all active nodes of a given type for a user (no embedding loaded).
     pub async fn get_user_nodes(
         &self,
@@ -1140,6 +1161,22 @@ impl GraphStore {
         let cnt: i64 = row.try_get("cnt").unwrap_or(0);
         self.node_count_cache.insert(user_id.to_string(), cnt);
         Ok(cnt)
+    }
+
+    /// Quick check whether a user has any graph edges at all.
+    /// Used to skip spreading activation when there's nothing to propagate.
+    pub async fn has_edges_for_user(&self, user_id: &str) -> bool {
+        let sql = format!(
+            "SELECT 1 FROM {} WHERE user_id = ? LIMIT 1",
+            self.t("memory_graph_edges"),
+        );
+        sqlx::query(&sql)
+            .bind(user_id)
+            .fetch_optional(&self.pool)
+            .await
+            .ok()
+            .flatten()
+            .is_some()
     }
 
     /// Get edges between a set of node IDs (for connected components).

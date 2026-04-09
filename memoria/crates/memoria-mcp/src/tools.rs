@@ -306,21 +306,24 @@ pub async fn call(
 
                 // Auto entity extraction (regex, lightweight)
                 let entities = memoria_storage::extract_entities(&m.content);
-                let mut links: Vec<(String, String, &str)> = Vec::new();
-                for ent in &entities {
-                    if let Ok((entity_id, _)) = graph
-                        .upsert_entity(user_id, &ent.name, &ent.display, &ent.entity_type)
-                        .await
-                    {
-                        links.push((m.memory_id.clone(), entity_id, "regex"));
-                    }
-                }
-                if !links.is_empty() {
-                    let refs: Vec<(&str, &str, &str)> = links
+                if !entities.is_empty() {
+                    let ent_tuples: Vec<(&str, &str, &str)> = entities
                         .iter()
-                        .map(|(m, e, s)| (m.as_str(), e.as_str(), *s))
+                        .map(|e| (e.name.as_str(), e.display.as_str(), e.entity_type.as_str()))
                         .collect();
-                    let _ = graph.batch_upsert_memory_entity_links(user_id, &refs).await;
+                    if let Ok(id_map) = graph.batch_upsert_entities(user_id, &ent_tuples).await {
+                        let links: Vec<(String, String, &str)> = id_map
+                            .into_iter()
+                            .map(|(_, eid)| (m.memory_id.clone(), eid, "regex"))
+                            .collect();
+                        if !links.is_empty() {
+                            let refs: Vec<(&str, &str, &str)> = links
+                                .iter()
+                                .map(|(m, e, s)| (m.as_str(), e.as_str(), *s))
+                                .collect();
+                            let _ = graph.batch_upsert_memory_entity_links(user_id, &refs).await;
+                        }
+                    }
                 }
             }
 

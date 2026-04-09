@@ -135,7 +135,7 @@ fn compact_identifier_fragment(value: &str, max_len: usize) -> String {
 }
 
 /// Convert user-facing snapshot name → internal MatrixOne snapshot name.
-fn snap_internal(db_name: &str, name: &str) -> String {
+pub fn snap_internal(db_name: &str, name: &str) -> String {
     if name.starts_with(SNAP_PREFIX) || name.starts_with(MILESTONE_PREFIX) {
         name.to_string()
     } else {
@@ -330,16 +330,13 @@ async fn acquire_snapshot_create_lock(
         if lock_store.try_acquire_lock(&lock_key, 30).await? {
             return Ok(Some(lock_key));
         }
-        if sql
-            .get_snapshot_registration(user_id, display)
-            .await?
-            .is_some()
-            || sql
-                .get_snapshot_registration_by_internal(user_id, internal)
-                .await?
-                .is_some()
-            || git.get_snapshot(internal).await.map_err(git_err)?.is_some()
-        {
+        // Check if snapshot was created by another holder — all 3 checks in parallel
+        let (r1, r2, r3) = tokio::join!(
+            sql.get_snapshot_registration(user_id, display),
+            sql.get_snapshot_registration_by_internal(user_id, internal),
+            git.get_snapshot(internal),
+        );
+        if r1?.is_some() || r2?.is_some() || r3.map_err(git_err)?.is_some() {
             return Ok(None);
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -502,80 +499,55 @@ pub async fn call(
     };
     match tool {
         GitToolCallName::MemorySnapshot => {
-            let user_snapshots = visible_snapshots_for_user(svc, user_id)
-                .await?
-                .into_iter()
-                .filter(|s| s.registered)
-                .count() as i64;
-            if user_snapshots >= MAX_USER_SNAPSHOTS {
-                return Ok(mcp_text(&format!(
-                    "Snapshot limit reached ({MAX_USER_SNAPSHOTS}) for user {user_id}. Delete old snapshots first."
-                )));
-            }
             let snap_name = args["name"].as_str().unwrap_or("");
             let sql = snapshot_store(svc, user_id).await?;
-            let internal = snap_internal(
-                sql.database_name().ok_or_else(|| {
-                    MemoriaError::Internal(
-                        "Snapshot ops require a database-backed SQL store".into(),
-                    )
-                })?,
-                snap_name,
-            );
+            let db_name = sql.database_name().ok_or_else(|| {
+                MemoriaError::Internal("Snapshot ops require a database-backed SQL store".into())
+            })?;
+            let internal = snap_internal(db_name, snap_name);
             let display = if snap_name.starts_with(SNAP_PREFIX) {
                 snap_display(snap_name)
             } else {
                 sanitize_name(snap_name)
             };
             let git = git_for_store(&sql)?;
-            let lock_store = svc.sql_store.as_ref().cloned().ok_or_else(|| {
-                MemoriaError::Internal("Snapshot ops require a database-backed SQL store".into())
-            })?;
-            let Some(lock_key) =
-                acquire_snapshot_create_lock(&lock_store, &sql, &git, user_id, &display, &internal)
-                    .await?
-            else {
+
+            // Optimistic approach: quota check + existence check in parallel (1 RTT),
+            // then CREATE SNAPSHOT directly, register on success.
+            // No distributed lock needed — CREATE SNAPSHOT is idempotent (fails if exists),
+            // and register_snapshot uses a conditional INSERT.
+            let (quota_result, reg_by_name, reg_by_internal) = tokio::join!(
+                sql.count_snapshot_registrations(user_id),
+                sql.get_snapshot_registration(user_id, &display),
+                sql.get_snapshot_registration_by_internal(user_id, &internal),
+            );
+            if reg_by_name?.is_some() || reg_by_internal?.is_some() {
                 return Ok(mcp_text(&format!("Snapshot '{}' already exists.", display)));
-            };
-            let result = async {
-                if sql
-                    .get_snapshot_registration(user_id, &display)
-                    .await?
-                    .is_some()
-                    || sql
-                        .get_snapshot_registration_by_internal(user_id, &internal)
-                        .await?
-                        .is_some()
-                {
-                    return Ok(mcp_text(&format!("Snapshot '{}' already exists.", display)));
-                }
-                let snap = match git.create_snapshot(&internal).await {
-                    Ok(snap) => snap,
-                    Err(err) => {
-                        if git
-                            .get_snapshot(&internal)
-                            .await
-                            .map_err(git_err)?
-                            .is_some()
-                        {
-                            return Ok(mcp_text(&format!(
-                                "Snapshot '{}' already exists.",
-                                display
-                            )));
-                        }
-                        return Err(git_err(err));
-                    }
-                };
-                sql.register_snapshot(user_id, &display, &snap.snapshot_name)
-                    .await?;
-                Ok(mcp_text(&format!(
-                    "Snapshot '{}' created at {:?}",
-                    display, snap.timestamp
-                )))
             }
-            .await;
-            let _ = lock_store.release_lock(&lock_key).await;
-            result
+            let user_snapshots = quota_result.unwrap_or(0);
+            if user_snapshots >= MAX_USER_SNAPSHOTS {
+                return Ok(mcp_text(&format!(
+                    "Snapshot limit reached ({MAX_USER_SNAPSHOTS}) for user {user_id}. Delete old snapshots first."
+                )));
+            }
+
+            // CREATE SNAPSHOT — if it fails with "already exists", treat as success
+            let snap = match git.create_snapshot(&internal).await {
+                Ok(snap) => snap,
+                Err(err) => {
+                    if git.get_snapshot(&internal).await.map_err(git_err)?.is_some() {
+                        // Another request created it concurrently — register if needed
+                        let _ = sql.register_snapshot(user_id, &display, &internal).await;
+                        return Ok(mcp_text(&format!("Snapshot '{}' already exists.", display)));
+                    }
+                    return Err(git_err(err));
+                }
+            };
+            sql.register_snapshot(user_id, &display, &snap.snapshot_name).await?;
+            Ok(mcp_text(&format!(
+                "Snapshot '{}' created at {:?}",
+                display, snap.timestamp
+            )))
         }
 
         GitToolCallName::MemorySnapshots => {
@@ -676,13 +648,17 @@ pub async fn call(
             let internal = resolve_snapshot_for_user(svc, user_id, snap_name)
                 .await?
                 .ok_or_else(|| MemoriaError::NotFound(format!("Snapshot '{snap_name}'")))?;
-            // Restore mem_memories (required) + graph tables (best-effort, like Python)
-            git.restore_table_from_snapshot("mem_memories", &internal)
+            // Restore mem_memories (required)
+            git.restore_table_from_snapshot_unchecked("mem_memories", &internal)
                 .await
                 .map_err(|e| MemoriaError::Internal(format!("Rollback failed: {e}")))?;
-            for table in &["memory_graph_nodes", "memory_graph_edges", "mem_edit_log"] {
-                let _ = git.restore_table_from_snapshot(table, &internal).await;
-            }
+            // Restore graph tables + edit_log in parallel (best-effort)
+            let (r1, r2, r3) = tokio::join!(
+                git.restore_table_from_snapshot_unchecked("memory_graph_nodes", &internal),
+                git.restore_table_from_snapshot_unchecked("memory_graph_edges", &internal),
+                git.restore_table_from_snapshot_unchecked("mem_edit_log", &internal),
+            );
+            let _ = (r1, r2, r3); // best-effort
             sql.invalidate_user_caches(user_id).await;
             Ok(mcp_text(&format!("Rolled back to snapshot '{snap_name}'")))
         }

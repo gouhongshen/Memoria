@@ -1304,11 +1304,14 @@ impl MemoryService {
             let emb = self.embed(query).await.unwrap_or(None);
             explain.embedding_ms = p0_start.elapsed().as_secs_f64() * 1000.0;
 
-            // Phase 1: graph retrieval (activation-based)
+            // Phase 1+2: Run graph retrieval and vector/hybrid search in parallel.
+            // Graph often misses (no edges), so waiting for it before starting
+            // vector wastes a full graph round-trip on the critical path.
             if let Some(ref embedding) = emb {
                 explain.graph_attempted = true;
+                explain.vector_attempted = true;
+
                 let g_start = std::time::Instant::now();
-                // Use isolated graph pool to avoid starving main pool
                 let graph_sql = if self.db_router.is_some() {
                     sql.as_ref()
                 } else {
@@ -1316,16 +1319,29 @@ impl MemoryService {
                 };
                 let graph_store = graph_sql.graph_store();
                 let retriever = memoria_storage::graph::ActivationRetriever::new(&graph_store);
-                match retriever
-                    .retrieve(user_id, query, embedding, top_k, None)
-                    .await
-                {
-                    Ok(scored_nodes) if !scored_nodes.is_empty() => {
-                        explain.graph_ms = g_start.elapsed().as_secs_f64() * 1000.0;
+
+                // Launch graph, feedback_weight, and hybrid search all concurrently.
+                // graph and hybrid use separate connection pools so they don't block each other.
+                let graph_fut = retriever.retrieve(user_id, query, embedding, top_k, None);
+                let fw_fut = self.get_feedback_weight(user_id);
+                let hybrid_fut = async {
+                    let fw = self.get_feedback_weight(user_id).await.unwrap_or(0.1);
+                    sql.search_hybrid_from_scored(&table, user_id, embedding, query, top_k, fw)
+                        .await
+                };
+                let (graph_result, _, hybrid_result) =
+                    tokio::join!(graph_fut, fw_fut, hybrid_fut);
+
+                let vs_start = std::time::Instant::now(); // for timing reference
+
+                explain.graph_ms = g_start.elapsed().as_secs_f64() * 1000.0;
+
+                // If graph returned enough results, use them (discard hybrid)
+                if let Ok(ref scored_nodes) = graph_result {
+                    if !scored_nodes.is_empty() {
                         explain.graph_hit = true;
                         explain.graph_candidates = scored_nodes.len();
 
-                        // Convert graph nodes to Memory objects via batch fetch
                         let memory_ids: Vec<String> = scored_nodes
                             .iter()
                             .filter_map(|(n, _)| n.memory_id.clone())
@@ -1338,7 +1354,7 @@ impl MemoryService {
 
                         let mut graph_memories: Vec<Memory> = Vec::new();
                         let mut seen = std::collections::HashSet::new();
-                        for (node, score) in &scored_nodes {
+                        for (node, score) in scored_nodes {
                             if let Some(ref mid) = node.memory_id {
                                 if seen.insert(mid.clone()) {
                                     if let Some(mut mem) = tabular.get(mid).cloned() {
@@ -1353,29 +1369,21 @@ impl MemoryService {
                             graph_memories.truncate(top_k as usize);
                             explain.path = "graph";
                             explain.result_count = graph_memories.len();
+                            // Record vector time even though we won't use results
+                            explain.vector_ms = g_start.elapsed().as_secs_f64() * 1000.0
+                                - explain.graph_ms;
                             explain.total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
                             return Ok((graph_memories, explain));
                         }
 
-                        // Graph insufficient — supplement with hybrid
-                        explain.vector_attempted = true;
-                        let vs_start = std::time::Instant::now();
-                        // Always use _scored directly with cached feedback_weight
-                        // to avoid redundant get_user_retrieval_params query
-                        let fw = self.get_feedback_weight(user_id).await?;
-                        let (vec_results, scores) = sql
-                            .search_hybrid_from_scored(&table, user_id, embedding, query, top_k, fw)
-                            .await?;
-                        explain.vector_ms = vs_start.elapsed().as_secs_f64() * 1000.0;
-                        explain.vector_hit = !vec_results.is_empty();
-
-                        // Merge: dedup (keep higher score), sort by score
-                        for m in vec_results {
-                            if seen.insert(m.memory_id.clone()) {
-                                graph_memories.push(m);
-                            } else {
-                                // Memory exists from graph — use higher score
-                                if let Some(existing) = graph_memories
+                        // Graph insufficient — merge with hybrid results
+                        if let Ok((vec_results, scores)) = hybrid_result {
+                            explain.vector_ms = g_start.elapsed().as_secs_f64() * 1000.0;
+                            explain.vector_hit = !vec_results.is_empty();
+                            for m in vec_results {
+                                if seen.insert(m.memory_id.clone()) {
+                                    graph_memories.push(m);
+                                } else if let Some(existing) = graph_memories
                                     .iter_mut()
                                     .find(|g| g.memory_id == m.memory_id)
                                 {
@@ -1384,14 +1392,40 @@ impl MemoryService {
                                     }
                                 }
                             }
+                            graph_memories.sort_by(|a, b| {
+                                b.retrieval_score
+                                    .partial_cmp(&a.retrieval_score)
+                                    .unwrap_or(std::cmp::Ordering::Equal)
+                            });
+                            graph_memories.truncate(top_k as usize);
+                            if level.at_least(ExplainLevel::Verbose) {
+                                explain.candidate_scores = scores
+                                    .into_iter()
+                                    .enumerate()
+                                    .map(|(i, (id, vs, ks, ts, cs, fs))| CandidateScore {
+                                        memory_id: id,
+                                        rank: i + 1,
+                                        final_score: round4(fs),
+                                        vector_score: round4(vs),
+                                        keyword_score: round4(ks),
+                                        temporal_score: round4(ts),
+                                        confidence_score: round4(cs),
+                                    })
+                                    .collect();
+                            }
+                            explain.path = "graph+vector";
+                            explain.result_count = graph_memories.len();
+                            explain.total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
+                            return Ok((graph_memories, explain));
                         }
-                        graph_memories.sort_by(|a, b| {
-                            b.retrieval_score
-                                .partial_cmp(&a.retrieval_score)
-                                .unwrap_or(std::cmp::Ordering::Equal)
-                        });
-                        graph_memories.truncate(top_k as usize);
+                    }
+                }
 
+                // Graph miss/fail — use hybrid results directly
+                explain.vector_ms = g_start.elapsed().as_secs_f64() * 1000.0;
+                if let Ok((results, scores)) = hybrid_result {
+                    if !results.is_empty() {
+                        explain.vector_hit = true;
                         if level.at_least(ExplainLevel::Verbose) {
                             explain.candidate_scores = scores
                                 .into_iter()
@@ -1407,52 +1441,11 @@ impl MemoryService {
                                 })
                                 .collect();
                         }
-                        explain.path = "graph+vector";
-                        explain.result_count = graph_memories.len();
+                        explain.path = "hybrid";
+                        explain.result_count = results.len();
                         explain.total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
-                        return Ok((graph_memories, explain));
+                        return Ok((results, explain));
                     }
-                    Ok(_) => {
-                        explain.graph_ms = g_start.elapsed().as_secs_f64() * 1000.0;
-                        // Graph returned nothing — fall through to vector
-                    }
-                    Err(_) => {
-                        explain.graph_ms = g_start.elapsed().as_secs_f64() * 1000.0;
-                        // Graph failed — fall through to vector
-                    }
-                }
-            }
-
-            // Phase 2: vector search (fallback)
-            if let Some(ref embedding) = emb {
-                explain.vector_attempted = true;
-                let vs_start = std::time::Instant::now();
-                let fw = self.get_feedback_weight(user_id).await?;
-                let (results, scores) = sql
-                    .search_hybrid_from_scored(&table, user_id, embedding, query, top_k, fw)
-                    .await?;
-                explain.vector_ms = vs_start.elapsed().as_secs_f64() * 1000.0;
-                if !results.is_empty() {
-                    explain.vector_hit = true;
-                    if level.at_least(ExplainLevel::Verbose) {
-                        explain.candidate_scores = scores
-                            .into_iter()
-                            .enumerate()
-                            .map(|(i, (id, vs, ks, ts, cs, fs))| CandidateScore {
-                                memory_id: id,
-                                rank: i + 1,
-                                final_score: round4(fs),
-                                vector_score: round4(vs),
-                                keyword_score: round4(ks),
-                                temporal_score: round4(ts),
-                                confidence_score: round4(cs),
-                            })
-                            .collect();
-                    }
-                    explain.path = "hybrid";
-                    explain.result_count = results.len();
-                    explain.total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
-                    return Ok((results, explain));
                 }
             }
 
@@ -1599,9 +1592,13 @@ impl MemoryService {
         if self.sql_store.is_some() {
             let sql = self.user_sql_store(user_id).await?;
             let table = sql.active_table(user_id).await?;
-            let old = sql
-                .get_from(&table, memory_id)
-                .await?
+
+            // Fetch old memory and embed new content in parallel — they're independent
+            let (old_result, emb_result) = tokio::join!(
+                sql.get_from(&table, memory_id),
+                self.embed(new_content),
+            );
+            let old = old_result?
                 .ok_or_else(|| MemoriaError::NotFound(memory_id.to_string()))?;
 
             let new_id = Uuid::now_v7().simple().to_string();
@@ -1612,7 +1609,7 @@ impl MemoryService {
                 memory_type: old.memory_type.clone(),
                 trust_tier: TrustTier::T2Curated,
                 initial_confidence: old.initial_confidence,
-                embedding: self.embed(new_content).await?,
+                embedding: emb_result?,
                 session_id: old.session_id.clone(),
                 source_event_ids: vec![format!("correct:{}", memory_id)],
                 extra_metadata: None,

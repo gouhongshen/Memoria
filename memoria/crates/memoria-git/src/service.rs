@@ -133,23 +133,24 @@ impl GitForDataService {
         table: &str,
         snapshot_name: &str,
     ) -> Result<(), MemoriaError> {
-        let safe_table = validate_identifier(table)?;
-        let safe_snap = validate_identifier(snapshot_name)?;
-        let db = quote_identifier(&self.db_name);
-        let qualified_table = format!("{db}.{safe_table}");
-
         // Verify snapshot exists
         self.get_snapshot(snapshot_name)
             .await?
             .ok_or_else(|| MemoriaError::NotFound(format!("Snapshot {snapshot_name}")))?;
+        self.restore_table_from_snapshot_unchecked(table, snapshot_name)
+            .await
+    }
 
-        // MO#23860: concurrent snapshot restore causes w-w conflict
-        // MO#23861: concurrent snapshot restore loses FULLTEXT INDEX secondary tables
-        // Callers must serialize snapshot operations until these are fixed.
-        //
-        // Note: ideally this would be transactional, but MatrixOne does not
-        // support {SNAPSHOT = '...'} syntax inside transactions. The DELETE+INSERT
-        // is non-atomic; callers should create a safety snapshot before rollback.
+    /// Restore without verifying snapshot existence (caller already checked).
+    pub async fn restore_table_from_snapshot_unchecked(
+        &self,
+        table: &str,
+        snapshot_name: &str,
+    ) -> Result<(), MemoriaError> {
+        let safe_table = validate_identifier(table)?;
+        let safe_snap = validate_identifier(snapshot_name)?;
+        let db = quote_identifier(&self.db_name);
+        let qualified_table = format!("{db}.{safe_table}");
         exec_ddl(&self.pool, &format!("DELETE FROM {qualified_table}")).await?;
         exec_ddl(
             &self.pool,
@@ -157,9 +158,7 @@ impl GitForDataService {
                 "INSERT INTO {qualified_table} SELECT * FROM {qualified_table} {{SNAPSHOT = '{safe_snap}'}}"
             ),
         )
-        .await?;
-
-        Ok(())
+        .await
     }
 
     // ── Branches ──────────────────────────────────────────────────────────────

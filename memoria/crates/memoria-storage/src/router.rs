@@ -24,8 +24,8 @@ const USER_DB_CACHE_MAX_CAPACITY: u64 = 10_000;
 const USER_STORE_CACHE_MAX_CAPACITY: u64 = 10_000;
 const USER_SCHEMA_CACHE_MAX_CAPACITY: u64 = 10_000;
 const USER_STORE_CACHE_IDLE_SECS: u64 = 600;
-const SHARED_POOL_MAX_CONNECTIONS: u32 = 16;
-const GLOBAL_USER_POOL_MAX_CONNECTIONS: u32 = 72;
+const SHARED_POOL_MAX_CONNECTIONS: u32 = 20;
+const GLOBAL_USER_POOL_MAX_CONNECTIONS: u32 = 100;
 const POOL_MAX_CONNECTIONS_UPPER: u32 = 256;
 
 #[derive(Debug, Clone)]
@@ -285,17 +285,16 @@ impl DbRouter {
                 .await
                 .map_err(|_| MemoriaError::Internal("user schema init semaphore closed".into()))?;
             if user_schema_cache.get(&user_id_owned).is_none() {
-                let db_url = user_db_url_from_shared(&shared_db_url, &db_name)?;
-                let init_result = match SqlMemoryStore::connect_routed(
-                    &db_url,
+                // Build a store backed by global_user_pool with qualified table names.
+                // No temporary per-user pool needed for migration.
+                let init_store = build_routed_store(
+                    global_user_pool.clone(),
+                    &shared_db_url,
                     embedding_dim,
-                    instance_id.clone(),
-                )
-                .await
-                {
-                    Ok(init_store) => init_store.migrate_user().await,
-                    Err(err) => Err(err),
-                };
+                    &instance_id,
+                    &db_name,
+                )?;
+                let init_result = init_store.migrate_user().await;
                 if let Err(err) = init_result {
                     if needs_init {
                         let _ = sqlx::query(
