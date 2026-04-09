@@ -2114,7 +2114,6 @@ impl SqlMemoryStore {
         operation: &str,
         cooldown_secs: i64,
     ) -> Result<Option<i64>, MemoriaError> {
-        let mut conn = self.conn().await?;
         let key = format!("{}:{}", user_id, operation);
         if let Some(last_run) = self.cooldown_cache.get(&key) {
             let elapsed = last_run.elapsed().as_secs() as i64;
