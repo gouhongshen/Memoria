@@ -167,55 +167,79 @@ impl AppState {
     ///
     /// This is strict on purpose: if the auth pool cannot be created, startup fails
     /// rather than letting auth traffic spill into the main business pool.
-    pub async fn init_auth_pool(mut self, database_url: &str) -> Result<Self, MemoriaError> {
-        let auth_max_connections = {
-            let raw: u32 = std::env::var("MEMORIA_AUTH_POOL_MAX_CONNECTIONS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(16);
-            let clamped = raw.clamp(1, AUTH_POOL_MAX_CONNECTIONS_UPPER);
-            if clamped != raw {
-                warn!(
-                    raw = raw,
-                    clamped = clamped,
-                    max = AUTH_POOL_MAX_CONNECTIONS_UPPER,
-                    "MEMORIA_AUTH_POOL_MAX_CONNECTIONS clamped to bounds"
-                );
-            }
-            clamped
-        };
-        let auth_acquire_timeout = {
-            let raw: u64 = std::env::var("MEMORIA_AUTH_POOL_ACQUIRE_TIMEOUT_SECS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(5);
-            let clamped = raw.clamp(1, AUTH_POOL_ACQUIRE_TIMEOUT_MAX_SECS);
-            if clamped != raw {
-                warn!(
-                    raw_secs = raw,
-                    clamped_secs = clamped,
-                    max = AUTH_POOL_ACQUIRE_TIMEOUT_MAX_SECS,
-                    "MEMORIA_AUTH_POOL_ACQUIRE_TIMEOUT_SECS clamped to bounds"
-                );
-            }
-            Duration::from_secs(clamped)
-        };
+    pub async fn init_auth_pool(self, database_url: &str) -> Result<Self, MemoriaError> {
+        self.init_auth_pool_inner(None, database_url).await
+    }
 
-        let pool = sqlx::mysql::MySqlPoolOptions::new()
-            .max_connections(auth_max_connections)
-            .max_lifetime(Duration::from_secs(3600))
-            .acquire_timeout(auth_acquire_timeout)
-            .idle_timeout(Duration::from_secs(300))
-            .connect(database_url)
-            .await
-            .map_err(|e| {
-                MemoriaError::Database(format!("failed to create dedicated auth pool: {e}"))
-            })?;
-        info!(
-            max_connections = auth_max_connections,
-            acquire_timeout_secs = auth_acquire_timeout.as_secs(),
-            "Dedicated auth connection pool initialized"
-        );
+    /// Like `init_auth_pool`, but reuses an externally-created pool instead of
+    /// opening a new one. Useful when the caller already has a shared pool for
+    /// the same database.
+    pub async fn init_auth_pool_shared(
+        self,
+        pool: sqlx::MySqlPool,
+    ) -> Result<Self, MemoriaError> {
+        self.init_auth_pool_inner(Some(pool), "").await
+    }
+
+    async fn init_auth_pool_inner(
+        mut self,
+        external_pool: Option<sqlx::MySqlPool>,
+        database_url: &str,
+    ) -> Result<Self, MemoriaError> {
+        let pool = if let Some(p) = external_pool {
+            info!("Auth pool: reusing shared connection pool");
+            p
+        } else {
+            let auth_max_connections = {
+                let raw: u32 = std::env::var("MEMORIA_AUTH_POOL_MAX_CONNECTIONS")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(16);
+                let clamped = raw.clamp(1, AUTH_POOL_MAX_CONNECTIONS_UPPER);
+                if clamped != raw {
+                    warn!(
+                        raw = raw,
+                        clamped = clamped,
+                        max = AUTH_POOL_MAX_CONNECTIONS_UPPER,
+                        "MEMORIA_AUTH_POOL_MAX_CONNECTIONS clamped to bounds"
+                    );
+                }
+                clamped
+            };
+            let auth_acquire_timeout = {
+                let raw: u64 = std::env::var("MEMORIA_AUTH_POOL_ACQUIRE_TIMEOUT_SECS")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(5);
+                let clamped = raw.clamp(1, AUTH_POOL_ACQUIRE_TIMEOUT_MAX_SECS);
+                if clamped != raw {
+                    warn!(
+                        raw_secs = raw,
+                        clamped_secs = clamped,
+                        max = AUTH_POOL_ACQUIRE_TIMEOUT_MAX_SECS,
+                        "MEMORIA_AUTH_POOL_ACQUIRE_TIMEOUT_SECS clamped to bounds"
+                    );
+                }
+                Duration::from_secs(clamped)
+            };
+
+            let p = sqlx::mysql::MySqlPoolOptions::new()
+                .max_connections(auth_max_connections)
+                .max_lifetime(Duration::from_secs(3600))
+                .acquire_timeout(auth_acquire_timeout)
+                .idle_timeout(Duration::from_secs(300))
+                .connect(database_url)
+                .await
+                .map_err(|e| {
+                    MemoriaError::Database(format!("failed to create dedicated auth pool: {e}"))
+                })?;
+            info!(
+                max_connections = auth_max_connections,
+                acquire_timeout_secs = auth_acquire_timeout.as_secs(),
+                "Dedicated auth connection pool initialized"
+            );
+            p
+        };
         // Start the batched last_used_at flusher using the auth pool
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
         let h1 = spawn_last_used_flusher(

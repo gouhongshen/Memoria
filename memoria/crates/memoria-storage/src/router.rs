@@ -25,7 +25,7 @@ const USER_STORE_CACHE_MAX_CAPACITY: u64 = 10_000;
 const USER_SCHEMA_CACHE_MAX_CAPACITY: u64 = 10_000;
 const USER_STORE_CACHE_IDLE_SECS: u64 = 600;
 const SHARED_POOL_MAX_CONNECTIONS: u32 = 16;
-const GLOBAL_USER_POOL_MAX_CONNECTIONS: u32 = 72;
+const GLOBAL_USER_POOL_MAX_CONNECTIONS: u32 = 120;
 const POOL_MAX_CONNECTIONS_UPPER: u32 = 256;
 
 #[derive(Debug, Clone)]
@@ -43,6 +43,7 @@ pub struct DbRouter {
     /// table names (qualified_table() pattern). `statement_cache_capacity=0`
     /// prevents cross-database prepared-statement pollution.
     global_user_pool: MySqlPool,
+    global_user_pool_health: Arc<std::sync::Mutex<crate::store::PoolHealthSnapshot>>,
     shared_db_url: String,
     shared_db_name: String,
     embedding_dim: usize,
@@ -78,6 +79,29 @@ impl DbRouter {
             "Shared routing pool initialized"
         );
 
+        Self::build_with_shared_pool(pool, shared_db_url, embedding_dim, instance_id).await
+    }
+
+    /// Create a router that reuses an externally-created shared pool.
+    /// The global_user_pool is still created internally because it requires
+    /// `statement_cache_capacity=0` which is incompatible with the shared pool.
+    pub async fn connect_with_shared_pool(
+        shared_pool: MySqlPool,
+        shared_db_url: &str,
+        embedding_dim: usize,
+        instance_id: String,
+    ) -> Result<Self, MemoriaError> {
+        create_database_if_missing_from_url(shared_db_url).await?;
+        Self::build_with_shared_pool(shared_pool, shared_db_url, embedding_dim, instance_id).await
+    }
+
+    async fn build_with_shared_pool(
+        pool: MySqlPool,
+        shared_db_url: &str,
+        embedding_dim: usize,
+        instance_id: String,
+    ) -> Result<Self, MemoriaError> {
+
         // Global pool for all per-user DB queries.
         // statement_cache_capacity=0 prevents prepared-statement cross-DB pollution.
         let global_max = configured_pool_max_connections(
@@ -100,6 +124,15 @@ impl DbRouter {
             "Global user pool initialized (statement_cache=0)"
         );
 
+        let global_user_pool_health = Arc::new(std::sync::Mutex::new(
+            crate::store::PoolHealthSnapshot::new_with_max(global_max),
+        ));
+        crate::store::spawn_pool_monitor(
+            global_user_pool.clone(),
+            Some(global_max),
+            global_user_pool_health.clone(),
+        );
+
         let shared_db_name = parse_db_name(shared_db_url)
             .ok_or_else(|| MemoriaError::Internal("invalid shared_db_url".into()))?;
         let user_init_max: usize = std::env::var("MEMORIA_USER_SCHEMA_INIT_MAX_CONCURRENCY")
@@ -110,6 +143,7 @@ impl DbRouter {
         let router = Self {
             shared_pool: pool,
             global_user_pool,
+            global_user_pool_health,
             shared_db_url: shared_db_url.to_string(),
             shared_db_name,
             embedding_dim,
@@ -137,6 +171,10 @@ impl DbRouter {
 
     pub fn global_user_pool(&self) -> &MySqlPool {
         &self.global_user_pool
+    }
+
+    pub fn global_user_pool_health(&self) -> crate::store::PoolHealthSnapshot {
+        self.global_user_pool_health.lock().unwrap().clone()
     }
 
     pub fn shared_db_name(&self) -> &str {
@@ -286,16 +324,14 @@ impl DbRouter {
                 .map_err(|_| MemoriaError::Internal("user schema init semaphore closed".into()))?;
             if user_schema_cache.get(&user_id_owned).is_none() {
                 let db_url = user_db_url_from_shared(&shared_db_url, &db_name)?;
-                let init_result = match SqlMemoryStore::connect_routed(
-                    &db_url,
+                let mut init_store = SqlMemoryStore::new(
+                    global_user_pool.clone(),
                     embedding_dim,
                     instance_id.clone(),
-                )
-                .await
-                {
-                    Ok(init_store) => init_store.migrate_user().await,
-                    Err(err) => Err(err),
-                };
+                );
+                init_store.set_db_name(db_name.clone());
+                init_store.set_database_url(db_url);
+                let init_result = init_store.migrate_user().await;
                 if let Err(err) = init_result {
                     if needs_init {
                         let _ = sqlx::query(

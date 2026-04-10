@@ -396,22 +396,51 @@ fn configured_server_pool_size(env_name: &str, default: u32, upper: u32) -> u32 
         .clamp(1, upper)
 }
 
+/// Create a single shared connection pool for the main database.
+/// All components that target the same DB (store, git, auth) share this pool.
 #[cfg(feature = "server-runtime")]
-async fn connect_git_pool(database_url: &str, multi_db: bool) -> Result<sqlx::MySqlPool> {
+async fn create_shared_pool(database_url: &str, multi_db: bool) -> Result<(sqlx::MySqlPool, u32)> {
     use sqlx::mysql::MySqlPoolOptions;
 
-    let default_max = if multi_db { 8 } else { 10 };
+    // Auto-create database if it doesn't exist
+    if let Some((base_url, db_name, _suffix)) =
+        memoria_storage::split_url(database_url)
+    {
+        if let Ok(base_pool) = MySqlPoolOptions::new()
+            .max_connections(1)
+            .connect(base_url)
+            .await
+        {
+            let _ = sqlx::raw_sql(&format!(
+                "CREATE DATABASE IF NOT EXISTS `{}`",
+                db_name.replace('`', "``")
+            ))
+            .execute(&base_pool)
+            .await;
+        }
+    }
+
+    let default_max: u32 = if multi_db { 28 } else { 80 };
     let max_connections =
-        configured_server_pool_size("MEMORIA_GIT_POOL_MAX_CONNECTIONS", default_max, 64);
+        configured_server_pool_size("MEMORIA_SHARED_POOL_MAX", default_max, 512);
+    let max_lifetime_secs: u64 = std::env::var("DB_MAX_LIFETIME_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3600);
     let pool = MySqlPoolOptions::new()
         .max_connections(max_connections)
-        .max_lifetime(std::time::Duration::from_secs(3600))
+        .max_lifetime(std::time::Duration::from_secs(max_lifetime_secs))
         .idle_timeout(std::time::Duration::from_secs(300))
         .acquire_timeout(std::time::Duration::from_secs(10))
         .connect(database_url)
         .await?;
-    tracing::info!(max_connections, "Git-for-data connection pool initialized");
-    Ok(pool)
+    tracing::info!(
+        max_connections,
+        max_lifetime_secs,
+        multi_db,
+        "Shared connection pool initialized"
+    );
+    Ok((pool, max_connections))
 }
 
 #[cfg(feature = "server-runtime")]
@@ -446,34 +475,42 @@ async fn cmd_serve(db_url: Option<String>, port: u16, master_key: String) -> Res
     );
 
     let (store, db_router, git_db_url) = if cfg.multi_db {
+        let (shared_pool, max_conns) = create_shared_pool(&cfg.shared_db_url, cfg.multi_db).await?;
         let router = Arc::new(
-            DbRouter::connect(
+            DbRouter::connect_with_shared_pool(
+                shared_pool.clone(),
                 &cfg.shared_db_url,
                 cfg.embedding_dim,
                 cfg.instance_id.clone(),
             )
             .await?,
         );
-        let mut store = SqlMemoryStore::connect_shared(
+        let mut store = SqlMemoryStore::with_pool(
+            shared_pool,
             &cfg.shared_db_url,
             cfg.embedding_dim,
             cfg.instance_id.clone(),
-        )
-        .await?;
+            max_conns,
+        );
         store.migrate_shared().await?;
         store.set_db_router(router.clone());
         (Arc::new(store), Some(router), cfg.shared_db_url.clone())
     } else {
-        let store =
-            SqlMemoryStore::connect(&cfg.db_url, cfg.embedding_dim, cfg.instance_id.clone())
-                .await?;
+        let (shared_pool, max_conns) = create_shared_pool(&cfg.db_url, cfg.multi_db).await?;
+        let store = SqlMemoryStore::with_pool(
+            shared_pool,
+            &cfg.db_url,
+            cfg.embedding_dim,
+            cfg.instance_id.clone(),
+            max_conns,
+        );
         store.migrate().await?;
         (Arc::new(store), None, cfg.db_url.clone())
     };
 
-    let pool = connect_git_pool(&git_db_url, cfg.multi_db).await?;
+    let shared_pool = store.pool().clone();
     let git_db_name = parse_db_name(&git_db_url).unwrap_or_else(|| cfg.db_name.clone());
-    let git = Arc::new(GitForDataService::new(pool, git_db_name));
+    let git = Arc::new(GitForDataService::new(shared_pool.clone(), git_db_name));
 
     let embedder = build_embedder(&cfg);
     let llm = build_llm(&cfg);
@@ -484,7 +521,7 @@ async fn cmd_serve(db_url: Option<String>, port: u16, master_key: String) -> Res
         .start();
     let state = AppState::new(service.clone(), git, master_key)
         .with_instance_id(cfg.instance_id.clone())
-        .init_auth_pool(cfg.effective_sql_url())
+        .init_auth_pool_shared(shared_pool)
         .await?;
 
     let app = build_router(state.clone()).layer(TraceLayer::new_for_http());
@@ -617,34 +654,41 @@ async fn cmd_mcp(
     );
 
     let (store, db_router, git_db_url) = if cfg.multi_db {
+        let (shared_pool, max_conns) = create_shared_pool(&cfg.shared_db_url, cfg.multi_db).await?;
         let router = Arc::new(
-            DbRouter::connect(
+            DbRouter::connect_with_shared_pool(
+                shared_pool.clone(),
                 &cfg.shared_db_url,
                 cfg.embedding_dim,
                 cfg.instance_id.clone(),
             )
             .await?,
         );
-        let mut store = SqlMemoryStore::connect_shared(
+        let mut store = SqlMemoryStore::with_pool(
+            shared_pool,
             &cfg.shared_db_url,
             cfg.embedding_dim,
             cfg.instance_id.clone(),
-        )
-        .await?;
+            max_conns,
+        );
         store.migrate_shared().await?;
         store.set_db_router(router.clone());
         (Arc::new(store), Some(router), cfg.shared_db_url.clone())
     } else {
-        let store =
-            SqlMemoryStore::connect(&cfg.db_url, cfg.embedding_dim, cfg.instance_id.clone())
-                .await?;
+        let (shared_pool, max_conns) = create_shared_pool(&cfg.db_url, cfg.multi_db).await?;
+        let store = SqlMemoryStore::with_pool(
+            shared_pool,
+            &cfg.db_url,
+            cfg.embedding_dim,
+            cfg.instance_id.clone(),
+            max_conns,
+        );
         store.migrate().await?;
         (Arc::new(store), None, cfg.db_url.clone())
     };
 
-    let pool = connect_git_pool(&git_db_url, cfg.multi_db).await?;
     let git_db_name = parse_db_name(&git_db_url).unwrap_or_else(|| cfg.db_name.clone());
-    let git = Arc::new(GitForDataService::new(pool, git_db_name));
+    let git = Arc::new(GitForDataService::new(store.pool().clone(), git_db_name));
 
     let embedder = build_embedder(&cfg);
     let llm = build_llm(&cfg);
