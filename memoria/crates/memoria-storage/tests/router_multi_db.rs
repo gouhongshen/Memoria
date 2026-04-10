@@ -196,3 +196,70 @@ async fn router_persists_and_repairs_user_schema_version_marker() {
     assert_eq!(repaired_version, CURRENT_USER_SCHEMA_VERSION);
     assert!(repaired_updated_at > stale_at);
 }
+
+#[tokio::test]
+async fn router_health_queries_use_user_database() {
+    let router = DbRouter::connect(&shared_db_url(), test_dim(), Uuid::new_v4().to_string())
+        .await
+        .expect("connect router");
+
+    let user = format!("router_health_{}", Uuid::new_v4().simple());
+    let store = router.user_store(&user).await.expect("user store");
+
+    let mut active = make_memory(
+        &format!("router-health-active-{}", Uuid::new_v4().simple()),
+        "router health active",
+        &user,
+    );
+    active.updated_at = Some(Utc::now());
+    store.insert(&active).await.expect("insert active memory");
+
+    let superseded = make_memory(
+        &format!("router-health-old-{}", Uuid::new_v4().simple()),
+        "router health superseded",
+        &user,
+    );
+    store
+        .insert(&superseded)
+        .await
+        .expect("insert superseded memory");
+    sqlx::query(&format!(
+        "UPDATE {} SET is_active = 0, superseded_by = ?, updated_at = NOW() WHERE memory_id = ?",
+        store.t("mem_memories")
+    ))
+    .bind("router-health-replacement")
+    .bind(&superseded.memory_id)
+    .execute(store.pool())
+    .await
+    .expect("mark superseded memory");
+
+    let analyze = store.health_analyze(&user).await.expect("health analyze");
+    assert_eq!(analyze["semantic"]["total"].as_i64(), Some(2));
+    let contradiction_rate = analyze["semantic"]["contradiction_rate"]
+        .as_f64()
+        .expect("contradiction rate");
+    assert!(
+        (contradiction_rate - 0.5).abs() < 1e-9,
+        "expected contradiction rate 0.5, got {contradiction_rate}"
+    );
+
+    let storage = store
+        .health_storage_stats(&user)
+        .await
+        .expect("health storage stats");
+    assert_eq!(storage["total"].as_i64(), Some(2));
+    assert_eq!(storage["active"].as_i64(), Some(1));
+    assert_eq!(storage["inactive"].as_i64(), Some(1));
+    assert!(
+        storage["avg_content_size"].as_f64().unwrap_or_default() > 0.0,
+        "avg content size should be positive: {storage}"
+    );
+
+    assert!(
+        store
+            .detect_pollution(&user, 1)
+            .await
+            .expect("detect pollution"),
+        "superseded recent memory should trip pollution detection"
+    );
+}
