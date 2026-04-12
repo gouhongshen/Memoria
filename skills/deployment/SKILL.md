@@ -13,6 +13,20 @@ docker compose up -d
 
 Services: API on `:8100`, MatrixOne on `:6001`. Verify: `curl http://localhost:8100/health`
 
+For both the old and current local Docker Compose layouts, users do **not** need to put a full `DATABASE_URL` into `.env`; compose synthesizes it from the DB name/password defaults. Manual DB URL overrides are only for custom topologies.
+
+## Upgrading an Existing Local Single-DB Deployment
+
+Memoria intentionally does **not** auto-migrate local Docker data on container startup. Use the explicit upgrade path instead:
+
+```bash
+cd Memoria
+memoria migrate legacy-to-multi-db --auto
+memoria migrate legacy-to-multi-db --auto --execute
+```
+
+For the default local Docker Compose layout, users do **not** need to provide legacy/shared DB URLs manually — `--auto` derives them from `.env`, and `--execute` writes the multi-db cutover settings back to `.env` after the data move completes. If startup finds legacy single-db data, `memoria serve` / `memoria mcp` now fail fast with a clear migration-required error that points users to the same CLI commands above. Pass `--report-out <path>` if you want a JSON report.
+
 ## Environment Variables
 
 ### Required
@@ -30,6 +44,9 @@ Services: API on `:8100`, MatrixOne on `:6001`. Verify: `curl http://localhost:8
 | `MEMORIA_DB_USER` | `root` | Database user |
 | `MEMORIA_DB_PASSWORD` | `111` | Database password |
 | `MEMORIA_DB_NAME` | `memoria` | Database name |
+| `MEMORIA_SHARED_DB_NAME` | `memoria_shared` | Compose helper for the target shared DB name during local cutover |
+| `MEMORIA_SHARED_DATABASE_URL` | Derived from `MEMORIA_SHARED_DB_NAME` | Explicit shared DB URL used when `MEMORIA_MULTI_DB=1` |
+| `MEMORIA_MULTI_DB` | `false` | Enable shared DB + per-user DB runtime |
 
 ### Embedding
 

@@ -13,6 +13,7 @@ mod benchmark;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
+use std::collections::BTreeMap;
 use std::future::IntoFuture;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -150,6 +151,8 @@ enum Commands {
         #[arg(long)]
         db_url: Option<String>,
         #[arg(long)]
+        shared_db_url: Option<String>,
+        #[arg(long)]
         api_url: Option<String>,
         #[arg(long)]
         token: Option<String>,
@@ -157,6 +160,8 @@ enum Commands {
         user: String,
         #[arg(long)]
         force: bool,
+        #[arg(long)]
+        multi_db: bool,
         #[arg(long)]
         embedding_provider: Option<String>,
         #[arg(long)]
@@ -363,13 +368,19 @@ enum MigrationCommands {
     LegacyToMultiDb {
         /// Legacy single-db DATABASE_URL (source)
         #[arg(long, env = "DATABASE_URL")]
-        legacy_db_url: String,
+        legacy_db_url: Option<String>,
         /// Shared DB URL for the target multi-db deployment
         #[arg(long, env = "MEMORIA_SHARED_DATABASE_URL")]
-        shared_db_url: String,
+        shared_db_url: Option<String>,
         /// Embedding dimension used by the target schema
-        #[arg(long, env = "EMBEDDING_DIM", default_value_t = 1024)]
-        embedding_dim: usize,
+        #[arg(long, env = "EMBEDDING_DIM")]
+        embedding_dim: Option<usize>,
+        /// Auto-fill local migration parameters from env / .env using official local deployment defaults
+        #[arg(long)]
+        auto: bool,
+        /// Local env file used by --auto (default: .env)
+        #[arg(long, default_value = ".env")]
+        env_file: PathBuf,
         /// Limit per-user migration to one or more users (for rehearsal/troubleshooting)
         #[arg(long = "user")]
         user_ids: Vec<String>,
@@ -419,7 +430,7 @@ async fn cmd_serve(db_url: Option<String>, port: u16, master_key: String) -> Res
     use memoria_api::{build_router, AppState};
     use memoria_git::GitForDataService;
     use memoria_service::{shutdown_signal, Config, MemoryService};
-    use memoria_storage::{DbRouter, SqlMemoryStore};
+    use memoria_storage::{detect_pending_legacy_single_db_migration, DbRouter, SqlMemoryStore};
     use tower_http::trace::TraceLayer;
 
     memoria_api::otel::init_tracing();
@@ -444,6 +455,14 @@ async fn cmd_serve(db_url: Option<String>, port: u16, master_key: String) -> Res
         governance_plugin_binding = %cfg.governance_plugin_binding,
         "Starting Memoria API server"
     );
+
+    if cfg.db_url != cfg.shared_db_url {
+        if let Some(pending) =
+            detect_pending_legacy_single_db_migration(&cfg.db_url, &cfg.shared_db_url).await?
+        {
+            return Err(anyhow::anyhow!(legacy_multi_db_guard_message(&pending)));
+        }
+    }
 
     let (store, db_router, git_db_url) = if cfg.multi_db {
         let router = Arc::new(
@@ -551,7 +570,7 @@ async fn cmd_mcp(
 ) -> Result<()> {
     use memoria_git::GitForDataService;
     use memoria_service::{Config, MemoryService};
-    use memoria_storage::{DbRouter, SqlMemoryStore};
+    use memoria_storage::{detect_pending_legacy_single_db_migration, DbRouter, SqlMemoryStore};
 
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -615,6 +634,14 @@ async fn cmd_mcp(
         user = %cfg.user,
         "Starting Memoria MCP (embedded mode)"
     );
+
+    if cfg.db_url != cfg.shared_db_url {
+        if let Some(pending) =
+            detect_pending_legacy_single_db_migration(&cfg.db_url, &cfg.shared_db_url).await?
+        {
+            return Err(anyhow::anyhow!(legacy_multi_db_guard_message(&pending)));
+        }
+    }
 
     let (store, db_router, git_db_url) = if cfg.multi_db {
         let router = Arc::new(
@@ -912,7 +939,218 @@ async fn cmd_plugin(command: PluginCommands) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_migrate(command: MigrationCommands) -> Result<()> {
+#[derive(Debug, Clone)]
+struct ResolvedLegacyToMultiDbMigration {
+    legacy_db_url: String,
+    shared_db_url: String,
+    embedding_dim: usize,
+    shared_db_name: String,
+    env_file: Option<PathBuf>,
+}
+
+fn non_empty(value: Option<String>) -> Option<String> {
+    value.and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
+fn strip_wrapping_quotes(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.len() >= 2
+        && ((trimmed.starts_with('"') && trimmed.ends_with('"'))
+            || (trimmed.starts_with('\'') && trimmed.ends_with('\'')))
+    {
+        trimmed[1..trimmed.len() - 1].to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn load_env_assignments(path: &Path) -> Result<BTreeMap<String, String>> {
+    let mut values = BTreeMap::new();
+    let content = std::fs::read_to_string(path)?;
+    for raw_line in content.lines() {
+        let mut line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(stripped) = line.strip_prefix("export ") {
+            line = stripped.trim();
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        values.insert(key.trim().to_string(), strip_wrapping_quotes(value.trim()));
+    }
+    Ok(values)
+}
+
+fn env_or_file(values: &BTreeMap<String, String>, key: &str) -> Option<String> {
+    non_empty(std::env::var(key).ok())
+        .or_else(|| values.get(key).cloned())
+        .and_then(|value| non_empty(Some(value)))
+}
+
+fn resolve_env_file_path(base_dir: &Path, env_file: &Path) -> PathBuf {
+    if env_file.is_absolute() {
+        env_file.to_path_buf()
+    } else {
+        base_dir.join(env_file)
+    }
+}
+
+fn build_local_db_url(password: &str, port: &str, db_name: &str) -> String {
+    format!("mysql://root:{password}@localhost:{port}/{db_name}")
+}
+
+fn replace_db_name_in_url(database_url: &str, db_name: &str) -> Option<String> {
+    let suffix_start = database_url.find(['?', '#']).unwrap_or(database_url.len());
+    let (head, suffix) = database_url.split_at(suffix_start);
+    let (prefix, _) = head.rsplit_once('/')?;
+    Some(format!("{prefix}/{db_name}{suffix}"))
+}
+
+fn upsert_env_assignment(path: &Path, key: &str, value: &str) -> Result<()> {
+    let content = std::fs::read_to_string(path)?;
+    let mut lines = Vec::new();
+    let mut replaced = false;
+    for line in content.lines() {
+        if line.trim_start().starts_with(&format!("{key}=")) {
+            lines.push(format!("{key}={value}"));
+            replaced = true;
+        } else {
+            lines.push(line.to_string());
+        }
+    }
+    if !replaced {
+        lines.push(format!("{key}={value}"));
+    }
+    let mut updated = lines.join("\n");
+    if content.ends_with('\n') {
+        updated.push('\n');
+    }
+    std::fs::write(path, updated)?;
+    Ok(())
+}
+
+fn backup_env_file(path: &Path) -> Result<PathBuf> {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let backup = PathBuf::from(format!("{}.bak.memoria-migrate.{ts}", path.display()));
+    std::fs::copy(path, &backup)?;
+    Ok(backup)
+}
+
+fn apply_local_multi_db_cutover(env_file: &Path, shared_db_name: &str) -> Result<PathBuf> {
+    let env_values = load_env_assignments(env_file)?;
+    let backup = backup_env_file(env_file)?;
+    upsert_env_assignment(env_file, "MEMORIA_DB_NAME", shared_db_name)?;
+    upsert_env_assignment(env_file, "MEMORIA_SHARED_DB_NAME", shared_db_name)?;
+    upsert_env_assignment(env_file, "MEMORIA_MULTI_DB", "1")?;
+    if let Some(database_url) = env_values.get("DATABASE_URL") {
+        if let Some(updated_url) = replace_db_name_in_url(database_url, shared_db_name) {
+            upsert_env_assignment(env_file, "DATABASE_URL", &updated_url)?;
+        }
+    }
+    if let Some(shared_db_url) = env_values.get("MEMORIA_SHARED_DATABASE_URL") {
+        if let Some(updated_url) = replace_db_name_in_url(shared_db_url, shared_db_name) {
+            upsert_env_assignment(env_file, "MEMORIA_SHARED_DATABASE_URL", &updated_url)?;
+        }
+    }
+    Ok(backup)
+}
+
+fn resolve_legacy_to_multi_db_inputs(
+    base_dir: &Path,
+    legacy_db_url: Option<String>,
+    shared_db_url: Option<String>,
+    embedding_dim: Option<usize>,
+    auto: bool,
+    env_file: &Path,
+) -> Result<ResolvedLegacyToMultiDbMigration> {
+    let resolved_env_file = if auto {
+        let path = resolve_env_file_path(base_dir, env_file);
+        if !path.is_file() {
+            anyhow::bail!(
+                "AUTO_CONFIG_INCOMPLETE: {} not found. Run the command from the Memoria deployment directory or pass --env-file explicitly.",
+                path.display()
+            );
+        }
+        Some(path)
+    } else {
+        None
+    };
+    let env_values = if let Some(path) = resolved_env_file.as_deref() {
+        load_env_assignments(path)?
+    } else {
+        BTreeMap::new()
+    };
+
+    let resolved_embedding_dim = embedding_dim
+        .or_else(|| env_or_file(&env_values, "EMBEDDING_DIM").and_then(|v| v.parse().ok()))
+        .or_else(|| env_or_file(&env_values, "MEMORIA_EMBEDDING_DIM").and_then(|v| v.parse().ok()))
+        .unwrap_or(1024);
+
+    let explicit_legacy_db_url =
+        non_empty(legacy_db_url).or_else(|| env_or_file(&env_values, "DATABASE_URL"));
+    let explicit_shared_db_url = non_empty(shared_db_url)
+        .or_else(|| env_or_file(&env_values, "MEMORIA_SHARED_DATABASE_URL"));
+
+    let (legacy_db_url, shared_db_url, shared_db_name) = if auto {
+        let db_password =
+            env_or_file(&env_values, "MEMORIA_DB_PASSWORD").unwrap_or_else(|| "111".to_string());
+        let matrixone_port =
+            env_or_file(&env_values, "MATRIXONE_PORT").unwrap_or_else(|| "6001".to_string());
+        let legacy_db_name = explicit_legacy_db_url
+            .as_deref()
+            .and_then(parse_db_name)
+            .or_else(|| env_or_file(&env_values, "MEMORIA_DB_NAME"))
+            .unwrap_or_else(|| "memoria".to_string());
+        let shared_db_name = explicit_shared_db_url
+            .as_deref()
+            .and_then(parse_db_name)
+            .or_else(|| env_or_file(&env_values, "MEMORIA_SHARED_DB_NAME"))
+            .unwrap_or_else(|| "memoria_shared".to_string());
+        (
+            explicit_legacy_db_url.unwrap_or_else(|| {
+                build_local_db_url(&db_password, &matrixone_port, &legacy_db_name)
+            }),
+            explicit_shared_db_url.unwrap_or_else(|| {
+                build_local_db_url(&db_password, &matrixone_port, &shared_db_name)
+            }),
+            shared_db_name,
+        )
+    } else {
+        let legacy_db_url = explicit_legacy_db_url
+            .ok_or_else(|| anyhow::anyhow!("--legacy-db-url is required unless --auto is set"))?;
+        let shared_db_url = explicit_shared_db_url
+            .ok_or_else(|| anyhow::anyhow!("--shared-db-url is required unless --auto is set"))?;
+        let shared_db_name = parse_db_name(&shared_db_url)
+            .ok_or_else(|| anyhow::anyhow!("invalid --shared-db-url"))?;
+        (legacy_db_url, shared_db_url, shared_db_name)
+    };
+
+    if legacy_db_url == shared_db_url {
+        anyhow::bail!("legacy_db_url and shared_db_url must point to different databases");
+    }
+
+    Ok(ResolvedLegacyToMultiDbMigration {
+        legacy_db_url,
+        shared_db_url,
+        embedding_dim: resolved_embedding_dim,
+        shared_db_name,
+        env_file: resolved_env_file,
+    })
+}
+
+async fn cmd_migrate(base_dir: &Path, command: MigrationCommands) -> Result<()> {
     use memoria_storage::{
         execute_legacy_single_db_to_multi_db, plan_legacy_single_db_to_multi_db,
         LegacyToMultiDbMigrationOptions, LegacyToMultiDbMigrationReport, TableMigrationReport,
@@ -988,28 +1226,49 @@ async fn cmd_migrate(command: MigrationCommands) -> Result<()> {
             legacy_db_url,
             shared_db_url,
             embedding_dim,
+            auto,
+            env_file,
             user_ids,
             concurrency,
             execute,
             report_out,
         } => {
+            let resolved = resolve_legacy_to_multi_db_inputs(
+                base_dir,
+                legacy_db_url,
+                shared_db_url,
+                embedding_dim,
+                auto,
+                &env_file,
+            )?;
+            if auto {
+                println!(
+                    "Auto-filled migration parameters:\n  legacy_db_url={}\n  shared_db_url={}\n  embedding_dim={}",
+                    redact_url(&resolved.legacy_db_url),
+                    redact_url(&resolved.shared_db_url),
+                    resolved.embedding_dim
+                );
+                if let Some(path) = resolved.env_file.as_deref() {
+                    println!("  env_file={}", path.display());
+                }
+            }
             let options = LegacyToMultiDbMigrationOptions {
                 user_ids,
                 concurrency,
             };
             let report = if execute {
                 execute_legacy_single_db_to_multi_db(
-                    &legacy_db_url,
-                    &shared_db_url,
-                    embedding_dim,
+                    &resolved.legacy_db_url,
+                    &resolved.shared_db_url,
+                    resolved.embedding_dim,
                     options,
                 )
                 .await?
             } else {
                 plan_legacy_single_db_to_multi_db(
-                    &legacy_db_url,
-                    &shared_db_url,
-                    embedding_dim,
+                    &resolved.legacy_db_url,
+                    &resolved.shared_db_url,
+                    resolved.embedding_dim,
                     options,
                 )
                 .await?
@@ -1019,10 +1278,28 @@ async fn cmd_migrate(command: MigrationCommands) -> Result<()> {
                 std::fs::write(&path, serde_json::to_string_pretty(&report)?)?;
                 println!("Saved report: {path}");
             }
+            if execute {
+                if let Some(env_file) = resolved.env_file.as_deref() {
+                    let backup = apply_local_multi_db_cutover(env_file, &resolved.shared_db_name)?;
+                    println!(
+                        "Updated {} for multi-db cutover (backup: {})",
+                        env_file.display(),
+                        backup.display()
+                    );
+                }
+            }
             if report.dry_run {
-                println!(
-                    "\nDry run only. Stop writers, resolve warnings, then rerun with --execute."
-                );
+                if auto {
+                    println!(
+                        "\nCheck only. Stop writers, resolve warnings, then rerun the same command with --execute:\n  memoria migrate legacy-to-multi-db --auto --execute"
+                    );
+                } else {
+                    println!(
+                        "\nDry run only. Stop writers, resolve warnings, then rerun with --execute."
+                    );
+                }
+            } else if auto {
+                println!("\nMigration complete. Start Memoria again.");
             }
         }
     }
@@ -1241,13 +1518,53 @@ where
 
 // ── Init / Status / Rules ─────────────────────────────────────────────────
 
+#[cfg(feature = "server-runtime")]
+fn legacy_multi_db_guard_message(
+    pending: &memoria_storage::PendingLegacyMultiDbMigration,
+) -> String {
+    let preview = pending
+        .missing_users
+        .iter()
+        .take(5)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let suffix = if pending.missing_users.len() > 5 {
+        format!(" (+{} more)", pending.missing_users.len() - 5)
+    } else {
+        String::new()
+    };
+    format!(
+        "MIGRATION_REQUIRED\n\
+This Memoria version detected legacy single-db data in '{}' while the target shared DB is '{}'.\n\
+Missing migrated users in shared registry: {} of {} [{}{}].\n\
+\n\
+Install or update the latest Memoria CLI:\n\
+  curl -fsSL https://raw.githubusercontent.com/matrixorigin/Memoria/main/scripts/install.sh | sh\n\
+\n\
+Check:\n\
+  memoria migrate legacy-to-multi-db --auto\n\
+\n\
+Execute:\n\
+  memoria migrate legacy-to-multi-db --auto --execute",
+        pending.legacy_db_name,
+        pending.shared_db_name,
+        pending.missing_users.len(),
+        pending.legacy_users.len(),
+        preview,
+        suffix
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn mcp_entry(
     db_url: Option<&str>,
+    shared_db_url: Option<&str>,
     api_url: Option<&str>,
     token: Option<&str>,
     user: &str,
     tool_name: &str,
+    multi_db: bool,
     embedding_provider: Option<&str>,
     embedding_model: Option<&str>,
     embedding_dim: Option<&str>,
@@ -1267,7 +1584,13 @@ fn mcp_entry(
         }
     } else {
         // Embedded mode
-        let url = db_url.unwrap_or("mysql://root:111@localhost:6001/memoria");
+        let url = if multi_db {
+            shared_db_url
+                .or(db_url)
+                .unwrap_or("mysql://root:111@localhost:6001/memoria_shared")
+        } else {
+            db_url.unwrap_or("mysql://root:111@localhost:6001/memoria")
+        };
         args.push("--db-url".to_string());
         args.push(url.to_string());
         args.push("--user".to_string());
@@ -1293,6 +1616,10 @@ fn mcp_entry(
         env.insert("EMBEDDING_DIM".into(), embedding_dim.unwrap_or("").into());
         env.insert("MEMORIA_GOVERNANCE_ENABLED".into(), "".into());
         env.insert("MEMORIA_GOVERNANCE_PLUGIN_BINDING".into(), "default".into());
+        if multi_db {
+            env.insert("MEMORIA_MULTI_DB".into(), "1".into());
+            env.insert("MEMORIA_SHARED_DATABASE_URL".into(), url.into());
+        }
         env.insert("_README".into(), serde_json::Value::String(
             "EMBEDDING_*: required for semantic search. Use 'openai' provider with any OpenAI-compatible API (SiliconFlow, Ollama, etc). MEMORIA_GOVERNANCE_PLUGIN_BINDING selects the shared repository binding resolved at startup.".to_string()
         ));
@@ -1826,6 +2153,9 @@ struct ExistingConfig {
     db_user: String,
     db_pass: String,
     db_name: String,
+    user: String,
+    shared_db_url: String,
+    multi_db: bool,
     emb_provider: String,
     emb_base_url: String,
     emb_api_key: String,
@@ -1842,6 +2172,9 @@ impl Default for ExistingConfig {
             db_user: "root".into(),
             db_pass: "111".into(),
             db_name: "memoria".into(),
+            user: "default".into(),
+            shared_db_url: String::new(),
+            multi_db: false,
             emb_provider: String::new(),
             emb_base_url: String::new(),
             emb_api_key: String::new(),
@@ -1938,6 +2271,11 @@ fn load_existing_config(project_dir: &Path) -> ExistingConfig {
                         }
                     }
                 }
+                if args[i].as_str() == Some("--user") {
+                    if let Some(user) = args.get(i + 1).and_then(|v| v.as_str()) {
+                        cfg.user = user.to_string();
+                    }
+                }
             }
         }
         if let Some(env) = entry["env"].as_object() {
@@ -1952,6 +2290,11 @@ fn load_existing_config(project_dir: &Path) -> ExistingConfig {
             cfg.emb_api_key = get("EMBEDDING_API_KEY");
             cfg.emb_model = get("EMBEDDING_MODEL");
             cfg.emb_dim = get("EMBEDDING_DIM");
+            cfg.shared_db_url = get("MEMORIA_SHARED_DATABASE_URL");
+            cfg.multi_db = matches!(
+                get("MEMORIA_MULTI_DB").trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            );
         }
     }
     cfg
@@ -2491,10 +2834,12 @@ fn cmd_init_interactive(
         &project_dir,
         tools,
         final_db_url,
+        None,
         final_api_url,
         final_token,
         "default".into(),
         force,
+        false,
         emb_provider,
         if emb_model.is_empty() {
             None
@@ -2526,29 +2871,79 @@ fn cmd_init(
     project_dir: &Path,
     tools: Vec<ToolName>,
     db_url: Option<String>,
+    shared_db_url: Option<String>,
     api_url: Option<String>,
     token: Option<String>,
     user: String,
     force: bool,
+    multi_db: bool,
     embedding_provider: Option<String>,
     embedding_model: Option<String>,
     embedding_dim: Option<String>,
     embedding_api_key: Option<String>,
     embedding_base_url: Option<String>,
 ) {
+    let existing = load_existing_config(project_dir);
+    let keep_existing = |value: &str| {
+        if value.trim().is_empty() {
+            None
+        } else {
+            Some(value.to_string())
+        }
+    };
+    let effective_user = if user == "default" && !existing.user.trim().is_empty() {
+        existing.user.clone()
+    } else {
+        user
+    };
+    let effective_db_url = db_url.or_else(|| {
+        if api_url.is_some() {
+            None
+        } else {
+            Some(format!(
+                "mysql://{}:{}@{}:{}/{}",
+                existing.db_user,
+                existing.db_pass,
+                existing.db_host,
+                existing.db_port,
+                existing.db_name
+            ))
+        }
+    });
+    let effective_multi_db = multi_db || existing.multi_db;
+    let effective_shared_db_url = shared_db_url
+        .or_else(|| keep_existing(&existing.shared_db_url))
+        .or_else(|| {
+            if effective_multi_db {
+                effective_db_url.clone()
+            } else {
+                None
+            }
+        });
+    let effective_embedding_provider =
+        embedding_provider.or_else(|| keep_existing(&existing.emb_provider));
+    let effective_embedding_model = embedding_model.or_else(|| keep_existing(&existing.emb_model));
+    let effective_embedding_dim = embedding_dim.or_else(|| keep_existing(&existing.emb_dim));
+    let effective_embedding_api_key =
+        embedding_api_key.or_else(|| keep_existing(&existing.emb_api_key));
+    let effective_embedding_base_url =
+        embedding_base_url.or_else(|| keep_existing(&existing.emb_base_url));
+
     for tool in &tools {
         println!("\n[{}]", tool);
         let entry = mcp_entry(
-            db_url.as_deref(),
+            effective_db_url.as_deref(),
+            effective_shared_db_url.as_deref(),
             api_url.as_deref(),
             token.as_deref(),
-            &user,
+            &effective_user,
             &tool.to_string(),
-            embedding_provider.as_deref(),
-            embedding_model.as_deref(),
-            embedding_dim.as_deref(),
-            embedding_api_key.as_deref(),
-            embedding_base_url.as_deref(),
+            effective_multi_db,
+            effective_embedding_provider.as_deref(),
+            effective_embedding_model.as_deref(),
+            effective_embedding_dim.as_deref(),
+            effective_embedding_api_key.as_deref(),
+            effective_embedding_base_url.as_deref(),
         );
         let results = match tool {
             ToolName::Kiro => configure_kiro(project_dir, &entry, force),
@@ -2565,7 +2960,7 @@ fn cmd_init(
     // Post-init guidance
     if api_url.is_none() {
         // Embedded mode checks
-        if embedding_provider.is_none() {
+        if effective_embedding_provider.is_none() {
             #[cfg(feature = "local-embedding")]
             println!("\n💡 No --embedding-provider specified. Using local embedding (all-MiniLM-L6-v2, dim=384).\n   Model will be downloaded on first query (~30MB to ~/.cache/fastembed/).");
             #[cfg(not(feature = "local-embedding"))]
@@ -3281,10 +3676,12 @@ fn main() -> Result<()> {
             tool,
             interactive,
             db_url,
+            shared_db_url,
             api_url,
             token,
             user,
             force,
+            multi_db,
             embedding_provider,
             embedding_model,
             embedding_dim,
@@ -3308,10 +3705,12 @@ fn main() -> Result<()> {
                     &project_dir,
                     tool,
                     db_url,
+                    shared_db_url,
                     api_url,
                     token,
                     user,
                     force,
+                    multi_db,
                     embedding_provider,
                     embedding_model,
                     embedding_dim,
@@ -3346,7 +3745,7 @@ fn main() -> Result<()> {
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?
-                .block_on(cmd_migrate(command))?;
+                .block_on(cmd_migrate(&project_dir, command))?;
         }
     }
     Ok(())
@@ -3355,14 +3754,14 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        redact_url, run_with_edit_log_drain, validate_embedding_config, Cli, Commands,
-        MigrationCommands,
+        legacy_multi_db_guard_message, redact_url, run_with_edit_log_drain,
+        validate_embedding_config, Cli, Commands, MigrationCommands,
     };
     use async_trait::async_trait;
     use clap::Parser;
     use memoria_core::{interfaces::MemoryStore, MemoriaError, Memory};
     use memoria_service::{Config, MemoryService};
-    use memoria_storage::OwnedEditLogEntry;
+    use memoria_storage::{OwnedEditLogEntry, PendingLegacyMultiDbMigration};
     use std::sync::{Arc, Mutex};
 
     #[derive(Default)]
@@ -3514,9 +3913,13 @@ mod tests {
             Commands::Migrate {
                 command:
                     MigrationCommands::LegacyToMultiDb {
-                        execute, user_ids, ..
+                        auto,
+                        execute,
+                        user_ids,
+                        ..
                     },
             } => {
+                assert!(!auto);
                 assert!(!execute);
                 assert!(user_ids.is_empty());
             }
@@ -3545,14 +3948,56 @@ mod tests {
             Commands::Migrate {
                 command:
                     MigrationCommands::LegacyToMultiDb {
-                        execute, user_ids, ..
+                        auto,
+                        execute,
+                        user_ids,
+                        ..
                     },
             } => {
+                assert!(!auto);
                 assert!(execute);
                 assert_eq!(user_ids, vec!["alice".to_string(), "bob".to_string()]);
             }
             _ => panic!("unexpected command"),
         }
+    }
+
+    #[test]
+    fn migrate_cli_accepts_auto_without_urls() {
+        let cli = Cli::parse_from(["memoria", "migrate", "legacy-to-multi-db", "--auto"]);
+
+        match cli.command {
+            Commands::Migrate {
+                command:
+                    MigrationCommands::LegacyToMultiDb {
+                        auto,
+                        execute,
+                        legacy_db_url,
+                        shared_db_url,
+                        ..
+                    },
+            } => {
+                assert!(auto);
+                assert!(!execute);
+                assert!(legacy_db_url.is_none());
+                assert!(shared_db_url.is_none());
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn legacy_guard_message_points_to_auto_migrate() {
+        let msg = legacy_multi_db_guard_message(&PendingLegacyMultiDbMigration {
+            legacy_db_name: "memoria".into(),
+            shared_db_name: "memoria_shared".into(),
+            legacy_users: vec!["alice".into(), "bob".into()],
+            missing_users: vec!["alice".into()],
+        });
+
+        assert!(msg.contains("MIGRATION_REQUIRED"));
+        assert!(msg.contains("memoria migrate legacy-to-multi-db --auto"));
+        assert!(msg.contains("--execute"));
     }
 
     #[test]
@@ -3578,10 +4023,12 @@ mod tests {
         // Remote mode
         let entry = mcp_entry(
             None,
+            None,
             Some("https://cloud.memoria.dev"),
             Some("tok"),
             "alice",
             "kiro",
+            false,
             None,
             None,
             None,
@@ -3597,7 +4044,12 @@ mod tests {
             "autoApprove must contain at least one tool"
         );
         // Core tools that the issue specifically calls out
-        for tool in &["memory_store", "memory_retrieve", "memory_search", "memory_purge"] {
+        for tool in &[
+            "memory_store",
+            "memory_retrieve",
+            "memory_search",
+            "memory_purge",
+        ] {
             assert!(
                 approved.iter().any(|v| v.as_str() == Some(tool)),
                 "autoApprove is missing tool: {tool}"
@@ -3609,8 +4061,10 @@ mod tests {
             Some("mysql://root:111@localhost:6001/memoria"),
             None,
             None,
+            None,
             "alice",
             "cursor",
+            false,
             Some("openai"),
             None,
             None,
@@ -3620,6 +4074,42 @@ mod tests {
         assert!(
             entry_embedded["autoApprove"].is_array(),
             "autoApprove must be present in embedded mode too"
+        );
+    }
+
+    #[test]
+    fn mcp_entry_embedded_multi_db_sets_shared_env() {
+        use super::mcp_entry;
+
+        let entry = mcp_entry(
+            Some("mysql://root:111@localhost:6001/memoria_shared"),
+            Some("mysql://root:111@localhost:6001/memoria_shared"),
+            None,
+            None,
+            "alice",
+            "cursor",
+            true,
+            Some("openai"),
+            Some("BAAI/bge-m3"),
+            Some("1024"),
+            Some("sk-test"),
+            Some("https://api.siliconflow.cn/v1"),
+        );
+
+        assert_eq!(
+            entry["env"]["MEMORIA_MULTI_DB"].as_str(),
+            Some("1"),
+            "embedded multi-db config must enable MEMORIA_MULTI_DB"
+        );
+        assert_eq!(
+            entry["env"]["MEMORIA_SHARED_DATABASE_URL"].as_str(),
+            Some("mysql://root:111@localhost:6001/memoria_shared"),
+            "embedded multi-db config must include the shared DB URL"
+        );
+        assert_eq!(
+            entry["args"][4].as_str(),
+            Some("mysql://root:111@localhost:6001/memoria_shared"),
+            "embedded multi-db config should point --db-url at the shared DB"
         );
     }
 }

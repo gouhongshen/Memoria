@@ -50,6 +50,14 @@ pub struct LegacyToMultiDbMigrationReport {
     pub warnings: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct PendingLegacyMultiDbMigration {
+    pub legacy_db_name: String,
+    pub shared_db_name: String,
+    pub legacy_users: Vec<String>,
+    pub missing_users: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct UserMigrationReport {
     pub user_id: String,
@@ -102,6 +110,54 @@ pub async fn execute_legacy_single_db_to_multi_db(
 ) -> Result<LegacyToMultiDbMigrationReport, MemoriaError> {
     run_legacy_single_db_to_multi_db(legacy_db_url, shared_db_url, embedding_dim, options, false)
         .await
+}
+
+pub async fn detect_pending_legacy_single_db_migration(
+    legacy_db_url: &str,
+    shared_db_url: &str,
+) -> Result<Option<PendingLegacyMultiDbMigration>, MemoriaError> {
+    let legacy_db_name = parse_db_name(legacy_db_url)?;
+    let shared_db_name = parse_db_name(shared_db_url)?;
+    if legacy_db_name == shared_db_name {
+        return Ok(None);
+    }
+
+    let legacy_pool = connect_pool(legacy_db_url).await?;
+    let mut legacy_users = discover_users(&legacy_pool, &legacy_db_name).await?;
+    legacy_users.sort();
+    legacy_users.dedup();
+    if legacy_users.is_empty() {
+        return Ok(None);
+    }
+
+    let shared_pool = connect_pool(shared_db_url).await?;
+    let shared_users = if table_exists(&shared_pool, &shared_db_name, "mem_user_registry").await? {
+        let rows = sqlx::query("SELECT user_id FROM mem_user_registry WHERE status = 'active'")
+            .fetch_all(&shared_pool)
+            .await
+            .map_err(db_err)?;
+        rows.into_iter()
+            .map(|row| row.try_get("user_id").map_err(db_err))
+            .collect::<Result<BTreeSet<String>, MemoriaError>>()?
+    } else {
+        BTreeSet::new()
+    };
+
+    let missing_users = legacy_users
+        .iter()
+        .filter(|user_id| !shared_users.contains(*user_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    if missing_users.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(PendingLegacyMultiDbMigration {
+            legacy_db_name,
+            shared_db_name,
+            legacy_users,
+            missing_users,
+        }))
+    }
 }
 
 async fn run_legacy_single_db_to_multi_db(
@@ -244,8 +300,7 @@ async fn run_legacy_single_db_to_multi_db(
                         if execute {
                             println!("Migrating user {user_id}");
                         }
-                        let res =
-                            migrate_user(pool, db_name, router_ref, user_id, execute).await;
+                        let res = migrate_user(pool, db_name, router_ref, user_id, execute).await;
                         (user_id.as_str(), res)
                     }
                 })

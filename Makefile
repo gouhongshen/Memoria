@@ -13,7 +13,6 @@ endif
 
 DB_URL ?= mysql://root:$(or $(MEMORIA_DB_PASSWORD),111)@localhost:$(or $(MATRIXONE_PORT),6001)/$(or $(MEMORIA_DB_NAME),memoria)
 TEST_DB_URL ?= mysql://root:$(or $(MEMORIA_DB_PASSWORD),111)@localhost:$(or $(MATRIXONE_PORT),6001)/$(or $(MEMORIA_TEST_DB_NAME),memoria_test)
-
 # Ensure cargo is in PATH
 export PATH := $(HOME)/.cargo/bin:$(PATH)
 

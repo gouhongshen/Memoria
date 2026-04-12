@@ -166,3 +166,16 @@ memoria mcp --transport sse
 | First query slow | Normal with local embedding (~3-5s). Use `openai` provider for faster response |
 | `local-embedding` not compiled | Use OpenAI-compatible service, or build from source with `--features local-embedding` |
 | AI tool doesn't see memory tools | 1. Run `which memoria` to verify CLI installed 2. Restart AI tool 3. Test MCP server directly |
+
+## Existing Local Single-DB Upgrade
+
+If this is an **existing** local self-hosted deployment from the old single-db layout, new Memoria versions fail fast with `MIGRATION_REQUIRED` until migration completes.
+
+Run this from the Memoria deployment directory:
+
+```bash
+memoria migrate legacy-to-multi-db --auto
+memoria migrate legacy-to-multi-db --auto --execute
+```
+
+For the default local Docker Compose layout, users do **not** need to provide legacy/shared DB URLs manually — `--auto` derives them from `.env`, and `--execute` writes the multi-db cutover settings back to `.env` after the data move completes. `memoria serve` / `memoria mcp` fail fast with `MIGRATION_REQUIRED` until that migration completes. Pass `--report-out <path>` if you want a JSON report.

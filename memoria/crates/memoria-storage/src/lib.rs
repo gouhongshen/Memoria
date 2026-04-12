@@ -9,8 +9,9 @@ pub use graph::{
     GraphStore,
 };
 pub use migration::{
-    execute_legacy_single_db_to_multi_db, plan_legacy_single_db_to_multi_db,
-    LegacyToMultiDbMigrationOptions, LegacyToMultiDbMigrationReport, TableMigrationReport,
+    detect_pending_legacy_single_db_migration, execute_legacy_single_db_to_multi_db,
+    plan_legacy_single_db_to_multi_db, LegacyToMultiDbMigrationOptions,
+    LegacyToMultiDbMigrationReport, PendingLegacyMultiDbMigration, TableMigrationReport,
     UserMigrationReport,
 };
 pub use router::{DbRouter, UserDatabaseRecord};

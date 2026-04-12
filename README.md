@@ -122,6 +122,7 @@ memoria init -i   # Select "Remote" mode, paste your token
 # 1. Start MatrixOne + API
 git clone https://github.com/matrixorigin/Memoria.git
 cd Memoria
+cp .env.example .env
 docker compose up -d
 
 # 2. Install CLI
@@ -131,6 +132,8 @@ curl -sSL https://raw.githubusercontent.com/matrixorigin/Memoria/main/scripts/in
 cd your-project
 memoria init -i   # Select "Embedded" mode
 ```
+
+Upgrading an existing local single-db deployment to the new shared DB + per-user DB layout? Run `memoria migrate legacy-to-multi-db --auto` to check what will change, then rerun `memoria migrate legacy-to-multi-db --auto --execute` to perform the cutover. For the default local Docker Compose layout, you do **not** need to type legacy/shared DB URLs by hand — `--auto` derives them from `.env`, writes the multi-db cutover settings back to `.env` on execute, and tells you to start Memoria again. `memoria serve` / `memoria mcp` now fail fast with a clear migration-required error until that migration completes. Pass `--report-out <path>` if you want a JSON report.
 
 Restart your AI tool, then ask: *"Do you have memory tools available?"*
 
