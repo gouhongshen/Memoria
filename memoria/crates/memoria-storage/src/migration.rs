@@ -130,18 +130,8 @@ pub async fn detect_pending_legacy_single_db_migration(
         return Ok(None);
     }
 
-    let shared_pool = connect_pool(shared_db_url).await?;
-    let shared_users = if table_exists(&shared_pool, &shared_db_name, "mem_user_registry").await? {
-        let rows = sqlx::query("SELECT user_id FROM mem_user_registry WHERE status = 'active'")
-            .fetch_all(&shared_pool)
-            .await
-            .map_err(db_err)?;
-        rows.into_iter()
-            .map(|row| row.try_get("user_id").map_err(db_err))
-            .collect::<Result<BTreeSet<String>, MemoriaError>>()?
-    } else {
-        BTreeSet::new()
-    };
+    let shared_users =
+        load_active_shared_registry_users_or_empty(shared_db_url, &shared_db_name).await?;
 
     let missing_users = legacy_users
         .iter()
@@ -504,6 +494,33 @@ async fn connect_pool(database_url: &str) -> Result<MySqlPool, MemoriaError> {
         .connect(database_url)
         .await
         .map_err(db_err)
+}
+
+async fn load_active_shared_registry_users_or_empty(
+    shared_db_url: &str,
+    shared_db_name: &str,
+) -> Result<BTreeSet<String>, MemoriaError> {
+    let shared_pool = match connect_pool(shared_db_url).await {
+        Ok(pool) => pool,
+        Err(MemoriaError::Database(msg))
+            if is_unknown_database_error_message(&msg, shared_db_name) =>
+        {
+            return Ok(BTreeSet::new());
+        }
+        Err(err) => return Err(err),
+    };
+
+    if !table_exists(&shared_pool, shared_db_name, "mem_user_registry").await? {
+        return Ok(BTreeSet::new());
+    }
+
+    let rows = sqlx::query("SELECT user_id FROM mem_user_registry WHERE status = 'active'")
+        .fetch_all(&shared_pool)
+        .await
+        .map_err(db_err)?;
+    rows.into_iter()
+        .map(|row| row.try_get("user_id").map_err(db_err))
+        .collect::<Result<BTreeSet<String>, MemoriaError>>()
 }
 
 async fn create_required_account_snapshot(
@@ -1205,10 +1222,19 @@ fn db_err(e: sqlx::Error) -> MemoriaError {
     MemoriaError::Database(e.to_string())
 }
 
+fn is_unknown_database_error_message(message: &str, db_name: &str) -> bool {
+    message.contains("1049")
+        && message.contains("Unknown database")
+        && (message.contains(db_name)
+            || message.contains(&format!("'{db_name}'"))
+            || message.contains(&format!("`{db_name}`")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        copyable_columns, pre_execute_account_snapshot_name, quote_ident,
+        copyable_columns, is_unknown_database_error_message, pre_execute_account_snapshot_name,
+        quote_ident,
         sanitize_identifier_fragment, ColumnSpec, MAX_IDENTIFIER_LEN,
         PRE_EXECUTE_ACCOUNT_SNAPSHOT_PREFIX, PRE_EXECUTE_ACCOUNT_SNAPSHOT_SUFFIX_LEN,
     };
@@ -1271,5 +1297,21 @@ mod tests {
         assert!(name.starts_with(PRE_EXECUTE_ACCOUNT_SNAPSHOT_PREFIX));
         let suffix = name.rsplit('_').next().expect("snapshot suffix");
         assert_eq!(suffix.len(), PRE_EXECUTE_ACCOUNT_SNAPSHOT_SUFFIX_LEN);
+    }
+
+    #[test]
+    fn unknown_database_message_matches_mysql_1049() {
+        assert!(is_unknown_database_error_message(
+            "error returned from database: 1049 (HY000): Unknown database memoria_shared",
+            "memoria_shared"
+        ));
+        assert!(is_unknown_database_error_message(
+            "error returned from database: 1049 (HY000): Unknown database 'memoria_shared'",
+            "memoria_shared"
+        ));
+        assert!(!is_unknown_database_error_message(
+            "error returned from database: 1045 (28000): Access denied for user",
+            "memoria_shared"
+        ));
     }
 }
