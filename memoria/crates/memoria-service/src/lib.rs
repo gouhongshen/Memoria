@@ -9,6 +9,7 @@ pub mod rebuild_worker;
 pub mod scheduler;
 pub mod scoring;
 pub mod service;
+pub mod stats_reporter;
 pub mod strategy;
 pub mod strategy_domain;
 pub mod vector_index_monitor;
@@ -45,8 +46,9 @@ pub use scoring::{
 };
 pub use service::{
     CandidateScore, ExplainLevel, InMemoryFlusher, MemoryService, PurgeResult, RetrievalExplain,
-    ENTITY_EXTRACTION_DROPS,
+    RetrieveOptions, ENTITY_EXTRACTION_DROPS,
 };
+pub use stats_reporter::StatsReporter;
 
 /// Wait for SIGTERM or Ctrl-C. Shared across CLI, MCP, and API servers.
 pub async fn shutdown_signal() {

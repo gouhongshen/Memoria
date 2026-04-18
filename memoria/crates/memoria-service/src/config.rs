@@ -33,6 +33,8 @@ pub struct Config {
     // Database
     pub db_url: String,
     pub db_name: String,
+    pub shared_db_url: String,
+    pub multi_db: bool,
 
     // Embedding
     pub embedding_provider: String,
@@ -66,6 +68,11 @@ pub struct Config {
     pub instance_id: String,
     /// Lock TTL in seconds for distributed leader election. Default: 120.
     pub lock_ttl_secs: u64,
+
+    /// Enable writing operational metrics to the shared DB for admin dashboard.
+    /// Only aggregate counters are written — no user memory content is stored.
+    /// Env: MEMORIA_OPS_METRICS (default: true).
+    pub ops_metrics_enabled: bool,
 }
 
 impl Config {
@@ -73,6 +80,13 @@ impl Config {
     pub fn from_env() -> Self {
         let db_url = std::env::var("DATABASE_URL")
             .unwrap_or_else(|_| "mysql://root:111@localhost:6001/memoria".to_string());
+        let multi_db = env_bool("MEMORIA_MULTI_DB");
+        let shared_db_url = std::env::var("MEMORIA_SHARED_DATABASE_URL")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| {
+                replace_db_name(&db_url, "memoria_shared").unwrap_or_else(|| db_url.clone())
+            });
 
         // Extract db_name from URL (last path segment) or from MEMORIA_DB_NAME
         let db_name = std::env::var("MEMORIA_DB_NAME")
@@ -88,6 +102,8 @@ impl Config {
         Self {
             db_url,
             db_name,
+            shared_db_url,
+            multi_db,
             embedding_provider: std::env::var("EMBEDDING_PROVIDER")
                 .unwrap_or_else(|_| "mock".to_string()),
             embedding_model: std::env::var("EMBEDDING_MODEL")
@@ -140,6 +156,15 @@ impl Config {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(120),
+            ops_metrics_enabled: env_bool_default("MEMORIA_OPS_METRICS", true),
+        }
+    }
+
+    pub fn effective_sql_url(&self) -> &str {
+        if self.multi_db {
+            &self.shared_db_url
+        } else {
+            &self.db_url
         }
     }
 
@@ -180,6 +205,47 @@ impl Config {
     pub fn has_governance_plugin(&self) -> bool {
         !self.governance_plugin_binding.trim().is_empty()
     }
+}
+
+fn env_bool(name: &str) -> bool {
+    matches!(
+        std::env::var(name)
+            .ok()
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
+
+fn env_bool_default(name: &str, default: bool) -> bool {
+    match std::env::var(name)
+        .ok()
+        .as_deref()
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("1" | "true" | "yes" | "on") => true,
+        Some("0" | "false" | "no" | "off") => false,
+        _ => default,
+    }
+}
+
+fn replace_db_name(database_url: &str, db_name: &str) -> Option<String> {
+    let (base, _, suffix) = split_database_url(database_url)?;
+    Some(format!("{base}/{db_name}{suffix}"))
+}
+
+fn split_database_url(database_url: &str) -> Option<(&str, &str, &str)> {
+    let suffix_start = database_url.find(['?', '#']).unwrap_or(database_url.len());
+    let (without_suffix, suffix) = database_url.split_at(suffix_start);
+    let (base, db_name) = without_suffix.rsplit_once('/')?;
+    if db_name.is_empty() {
+        return None;
+    }
+    Some((base, db_name, suffix))
 }
 
 #[cfg(test)]
@@ -431,5 +497,52 @@ mod tests {
                 assert!(cfg.embedding_endpoints.is_empty());
             },
         );
+    }
+
+    // ── env_bool_default / ops_metrics_enabled tests ─────────────────────────
+
+    #[test]
+    fn ops_metrics_defaults_to_true_when_unset() {
+        with_env(&[("MEMORIA_OPS_METRICS", None)], || {
+            let cfg = Config::from_env();
+            assert!(cfg.ops_metrics_enabled, "should be enabled by default");
+        });
+    }
+
+    #[test]
+    fn ops_metrics_recognised_truthy_values() {
+        for val in &["1", "true", "True", "TRUE", "yes", "YES", "on", "ON"] {
+            with_env(&[("MEMORIA_OPS_METRICS", Some(val))], || {
+                let cfg = Config::from_env();
+                assert!(
+                    cfg.ops_metrics_enabled,
+                    "MEMORIA_OPS_METRICS={val:?} should be truthy"
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn ops_metrics_recognised_falsy_values() {
+        for val in &["0", "false", "False", "FALSE", "no", "NO", "off", "OFF"] {
+            with_env(&[("MEMORIA_OPS_METRICS", Some(val))], || {
+                let cfg = Config::from_env();
+                assert!(
+                    !cfg.ops_metrics_enabled,
+                    "MEMORIA_OPS_METRICS={val:?} should be falsy"
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn ops_metrics_unknown_value_falls_back_to_default() {
+        with_env(&[("MEMORIA_OPS_METRICS", Some("maybe"))], || {
+            let cfg = Config::from_env();
+            assert!(
+                cfg.ops_metrics_enabled,
+                "unrecognised value should fall back to the default (true)"
+            );
+        });
     }
 }

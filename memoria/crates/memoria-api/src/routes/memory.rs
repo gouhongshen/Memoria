@@ -211,39 +211,40 @@ pub async fn retrieve(
     AuthUser { user_id, .. }: AuthUser,
     Json(req): Json<RetrieveRequest>,
 ) -> ApiResult<serde_json::Value> {
+    if req.session_id.is_none() && (req.filter_session == Some(true) || !req.include_cross_session)
+    {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "session_id is required for strict session retrieval".to_string(),
+        ));
+    }
     let top_k = req.top_k.clamp(1, 100);
     let level = memoria_service::ExplainLevel::from_str_or_bool(&req.explain);
-    let filter_session = req
-        .session_id
-        .as_deref()
-        .filter(|_| !req.include_cross_session);
-
-    let apply_filter = |mut mems: Vec<memoria_core::Memory>| -> Vec<memoria_core::Memory> {
-        if let Some(sid) = filter_session {
-            mems.retain(|m| m.session_id.as_deref() == Some(sid));
-        }
-        mems
-    };
+    let retrieve_options = req.retrieve_options();
 
     if level != memoria_service::ExplainLevel::None {
         let (results, explain) = state
             .service
-            .retrieve_explain_level(&user_id, &req.query, top_k, level)
+            .retrieve_explain_level_with_options(
+                &user_id,
+                &req.query,
+                top_k,
+                level,
+                &retrieve_options,
+            )
             .await
             .map_err(api_err)?;
-        let items: Vec<MemoryResponse> =
-            apply_filter(results).into_iter().map(Into::into).collect();
+        let items: Vec<MemoryResponse> = results.into_iter().map(Into::into).collect();
         Ok(Json(
             serde_json::json!({"results": items, "explain": explain}),
         ))
     } else {
         let results = state
             .service
-            .retrieve(&user_id, &req.query, top_k)
+            .retrieve_with_options(&user_id, &req.query, top_k, &retrieve_options)
             .await
             .map_err(api_err)?;
-        let items: Vec<MemoryResponse> =
-            apply_filter(results).into_iter().map(Into::into).collect();
+        let items: Vec<MemoryResponse> = results.into_iter().map(Into::into).collect();
         Ok(Json(serde_json::json!(items)))
     }
 }
@@ -370,38 +371,51 @@ pub async fn purge_memories(
     AuthUser { user_id, is_master }: AuthUser,
     Json(req): Json<PurgeRequest>,
 ) -> ApiResult<PurgeResponse> {
-    let result = if let Some(ids) = &req.memory_ids {
-        if !is_master {
-            for id in ids {
-                let mem = state
-                    .service
-                    .get_for_user(&user_id, id)
-                    .await
-                    .map_err(api_err)?
-                    .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Memory not found: {id}")))?;
-                if mem.user_id != user_id {
-                    return Err((StatusCode::FORBIDDEN, format!("Not your memory: {id}")));
+    let selector = req
+        .selector()
+        .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?;
+    let result = match selector {
+        PurgeSelector::MemoryIds(ids) => {
+            if !is_master {
+                for id in &ids {
+                    let mem = state
+                        .service
+                        .get_for_user(&user_id, id)
+                        .await
+                        .map_err(api_err)?
+                        .ok_or_else(|| {
+                            (StatusCode::NOT_FOUND, format!("Memory not found: {id}"))
+                        })?;
+                    if mem.user_id != user_id {
+                        return Err((StatusCode::FORBIDDEN, format!("Not your memory: {id}")));
+                    }
                 }
             }
+            let id_refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
+            state
+                .service
+                .purge_batch(&user_id, &id_refs)
+                .await
+                .map_err(api_err)?
         }
-        let id_refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
-        state
+        PurgeSelector::Topic(topic) => state
             .service
-            .purge_batch(&user_id, &id_refs)
+            .purge_by_topic(&user_id, &topic)
             .await
-            .map_err(api_err)?
-    } else if let Some(topic) = &req.topic {
-        state
+            .map_err(api_err)?,
+        PurgeSelector::Session {
+            session_id,
+            memory_types,
+        } => state
             .service
-            .purge_by_topic(&user_id, topic)
+            .purge_by_session_id(&user_id, &session_id, memory_types.as_deref())
             .await
-            .map_err(api_err)?
-    } else {
-        memoria_service::PurgeResult {
+            .map_err(api_err)?,
+        PurgeSelector::None => memoria_service::PurgeResult {
             purged: 0,
             snapshot_name: None,
             warning: None,
-        }
+        },
     };
     Ok(Json(PurgeResponse {
         purged: result.purged,
@@ -427,9 +441,10 @@ pub async fn get_profile(
     };
     let sql = state
         .service
-        .sql_store
-        .as_ref()
-        .ok_or_else(|| api_err("SQL store required"))?;
+        .user_sql_store(&resolved)
+        .await
+        .map_err(api_err)?;
+    let table = sql.active_table(&resolved).await.map_err(api_err)?;
     let memories = state
         .service
         .list_active(&resolved, 50)
@@ -441,14 +456,16 @@ pub async fn get_profile(
         .map(|m| m.content.as_str())
         .collect();
 
-    // Stats enrichment (matches Python)
-    // TODO: make branch-aware — currently hardcoded to mem_memories
-    let stats: serde_json::Value = sqlx::query(
+    // Stats enrichment follows the user's active branch table.
+    let stats_query = format!(
         "SELECT memory_type, COUNT(*) as cnt, \
          ROUND(AVG(initial_confidence), 2) as avg_conf, \
          MIN(observed_at) as oldest, MAX(observed_at) as newest \
-         FROM mem_memories WHERE user_id = ? AND is_active = 1 GROUP BY memory_type"
-    ).bind(&resolved).fetch_all(sql.pool()).await
+         FROM {table} WHERE user_id = ? AND is_active = 1 GROUP BY memory_type"
+    );
+    let stats: serde_json::Value = sqlx::query(&stats_query)
+    .bind(&resolved)
+    .fetch_all(sql.pool()).await
     .map(|rows| {
         let mut by_type = serde_json::Map::new();
         let mut total = 0i64;
@@ -527,12 +544,11 @@ pub async fn get_memory_history(
 ) -> ApiResult<serde_json::Value> {
     use sqlx::Row;
 
-    let sql = state.service.sql_store.as_ref().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "SQL store required".to_string(),
-        )
-    })?;
+    let sql = state
+        .service
+        .user_sql_store(&user_id)
+        .await
+        .map_err(api_err)?;
     let table = sql.active_table(&user_id).await.map_err(api_err)?;
 
     let mut chain = Vec::new();
@@ -546,7 +562,7 @@ pub async fn get_memory_history(
         }
         let row = sqlx::query(&format!(
             "SELECT memory_id, content, is_active, superseded_by, observed_at, memory_type \
-                 FROM `{}` WHERE memory_id = ? AND user_id = ?",
+                 FROM {} WHERE memory_id = ? AND user_id = ?",
             table
         ))
         .bind(&cid)
@@ -585,7 +601,7 @@ pub async fn get_memory_history(
         loop {
             let older = sqlx::query(&format!(
                 "SELECT memory_id, content, is_active, superseded_by, observed_at, memory_type \
-                     FROM `{}` WHERE superseded_by = ? AND user_id = ?",
+                     FROM {} WHERE superseded_by = ? AND user_id = ?",
                 table
             ))
             .bind(&prev_id)
@@ -747,12 +763,11 @@ pub async fn get_retrieval_params(
     State(state): State<AppState>,
     AuthUser { user_id, .. }: AuthUser,
 ) -> ApiResult<serde_json::Value> {
-    let sql = state.service.sql_store.as_ref().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "SQL store not available".to_string(),
-        )
-    })?;
+    let sql = state
+        .service
+        .user_sql_store(&user_id)
+        .await
+        .map_err(api_err)?;
     let params = sql
         .get_user_retrieval_params(&user_id)
         .await
@@ -773,12 +788,11 @@ pub async fn set_retrieval_params(
     AuthUser { user_id, .. }: AuthUser,
     Json(req): Json<SetRetrievalParamsRequest>,
 ) -> ApiResult<serde_json::Value> {
-    let sql = state.service.sql_store.as_ref().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "SQL store not available".to_string(),
-        )
-    })?;
+    let sql = state
+        .service
+        .user_sql_store(&user_id)
+        .await
+        .map_err(api_err)?;
 
     let mut params = sql
         .get_user_retrieval_params(&user_id)
@@ -808,12 +822,11 @@ pub async fn tune_retrieval_params(
 ) -> ApiResult<serde_json::Value> {
     use memoria_service::scoring::{DefaultScoringPlugin, ScoringPlugin};
 
-    let sql = state.service.sql_store.as_ref().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "SQL store not available".to_string(),
-        )
-    })?;
+    let sql = state
+        .service
+        .user_sql_store(&user_id)
+        .await
+        .map_err(api_err)?;
 
     let old_params = sql
         .get_user_retrieval_params(&user_id)
@@ -843,7 +856,14 @@ pub async fn get_tool_usage(
     State(state): State<AppState>,
     AuthUser { user_id, .. }: AuthUser,
 ) -> ApiResult<serde_json::Value> {
-    let usage = state.tool_usage_batcher.get_user_tool_usage(&user_id);
+    let mut usage = state.tool_usage_batcher.get_user_tool_usage(&user_id);
+    if usage.is_empty() {
+        state
+            .tool_usage_batcher
+            .load_user_from_db(&state.service, &user_id)
+            .await;
+        usage = state.tool_usage_batcher.get_user_tool_usage(&user_id);
+    }
     let items: Vec<serde_json::Value> = usage
         .into_iter()
         .map(|(tool, ts)| serde_json::json!({"tool_name": tool, "last_used_at": ts.to_rfc3339()}))

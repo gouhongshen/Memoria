@@ -167,9 +167,48 @@ pub trait GovernanceStore: Send + Sync {
     }
 }
 
+fn routed_user_store(
+    store: &SqlMemoryStore,
+    user_id: &str,
+) -> Result<Option<SqlMemoryStore>, MemoriaError> {
+    match store.db_router() {
+        Some(router) => Ok(Some(router.routed_store_for_user(user_id)?)),
+        None => Ok(None),
+    }
+}
+
+async fn routed_user_stores(
+    store: &SqlMemoryStore,
+) -> Result<Option<Vec<(String, SqlMemoryStore)>>, MemoriaError> {
+    let Some(router) = store.db_router() else {
+        return Ok(None);
+    };
+    let shared_pool = router.shared_pool().clone();
+    let user_ids: Vec<(String,)> =
+        sqlx::query_as("SELECT user_id FROM mem_user_registry WHERE status = 'active'")
+            .fetch_all(&shared_pool)
+            .await
+            .map_err(|e| MemoriaError::Database(e.to_string()))?;
+    let mut stores = Vec::with_capacity(user_ids.len());
+    for (user_id,) in user_ids {
+        let user_store = router.routed_store_for_user(&user_id)?;
+        stores.push((user_id, user_store));
+    }
+    Ok(Some(stores))
+}
+
 #[async_trait]
 impl GovernanceStore for SqlMemoryStore {
     async fn list_active_users(&self) -> Result<Vec<String>, MemoriaError> {
+        if let Some(router) = self.db_router() {
+            let shared_pool = router.shared_pool().clone();
+            let users: Vec<(String,)> =
+                sqlx::query_as("SELECT user_id FROM mem_user_registry WHERE status = 'active'")
+                    .fetch_all(&shared_pool)
+                    .await
+                    .map_err(|e| MemoriaError::Database(e.to_string()))?;
+            return Ok(users.into_iter().map(|(user_id,)| user_id).collect());
+        }
         let users: Vec<(String,)> =
             sqlx::query_as("SELECT DISTINCT user_id FROM mem_memories WHERE is_active > 0")
                 .fetch_all(self.pool())
@@ -179,7 +218,15 @@ impl GovernanceStore for SqlMemoryStore {
     }
 
     async fn cleanup_tool_results(&self, ttl_hours: i64) -> Result<i64, MemoriaError> {
-        SqlMemoryStore::cleanup_tool_results(self, ttl_hours).await
+        let store = self.clone();
+        if let Some(user_stores) = routed_user_stores(&store).await? {
+            let mut total = 0i64;
+            for (_, store) in user_stores {
+                total += SqlMemoryStore::cleanup_tool_results(&store, ttl_hours).await?;
+            }
+            return Ok(total);
+        }
+        SqlMemoryStore::cleanup_tool_results(&store, ttl_hours).await
     }
 
     async fn cleanup_async_tasks(&self, ttl_hours: i64) -> Result<i64, MemoriaError> {
@@ -198,15 +245,31 @@ impl GovernanceStore for SqlMemoryStore {
         &self,
         stale_hours: i64,
     ) -> Result<Vec<(String, i64)>, MemoriaError> {
-        SqlMemoryStore::archive_stale_working(self, stale_hours).await
+        let store = self.clone();
+        if let Some(user_stores) = routed_user_stores(&store).await? {
+            let mut results = Vec::new();
+            for (_, store) in user_stores {
+                results.extend(SqlMemoryStore::archive_stale_working(&store, stale_hours).await?);
+            }
+            return Ok(results);
+        }
+        SqlMemoryStore::archive_stale_working(&store, stale_hours).await
     }
 
     async fn cleanup_stale(&self, user_id: &str) -> Result<i64, MemoriaError> {
-        SqlMemoryStore::cleanup_stale(self, user_id).await
+        let store = self.clone();
+        if let Some(user_store) = routed_user_store(&store, user_id)? {
+            return SqlMemoryStore::cleanup_stale(&user_store, user_id).await;
+        }
+        SqlMemoryStore::cleanup_stale(&store, user_id).await
     }
 
     async fn quarantine_low_confidence(&self, user_id: &str) -> Result<i64, MemoriaError> {
-        SqlMemoryStore::quarantine_low_confidence(self, user_id).await
+        let store = self.clone();
+        if let Some(user_store) = routed_user_store(&store, user_id)? {
+            return SqlMemoryStore::quarantine_low_confidence(&user_store, user_id).await;
+        }
+        SqlMemoryStore::quarantine_low_confidence(&store, user_id).await
     }
 
     async fn compress_redundant(
@@ -216,8 +279,19 @@ impl GovernanceStore for SqlMemoryStore {
         window_days: i64,
         max_pairs: usize,
     ) -> Result<i64, MemoriaError> {
+        let store = self.clone();
+        if let Some(user_store) = routed_user_store(&store, user_id)? {
+            return SqlMemoryStore::compress_redundant(
+                &user_store,
+                user_id,
+                similarity_threshold,
+                window_days,
+                max_pairs,
+            )
+            .await;
+        }
         SqlMemoryStore::compress_redundant(
-            self,
+            &store,
             user_id,
             similarity_threshold,
             window_days,
@@ -231,31 +305,83 @@ impl GovernanceStore for SqlMemoryStore {
         user_id: &str,
         older_than_hours: i64,
     ) -> Result<i64, MemoriaError> {
-        SqlMemoryStore::cleanup_orphaned_incrementals(self, user_id, older_than_hours).await
+        let store = self.clone();
+        if let Some(user_store) = routed_user_store(&store, user_id)? {
+            return SqlMemoryStore::cleanup_orphaned_incrementals(
+                &user_store,
+                user_id,
+                older_than_hours,
+            )
+            .await;
+        }
+        SqlMemoryStore::cleanup_orphaned_incrementals(&store, user_id, older_than_hours).await
     }
 
     async fn rebuild_vector_index(&self, table: &str) -> Result<i64, MemoriaError> {
-        SqlMemoryStore::rebuild_vector_index(self, table).await
+        let store = self.clone();
+        if matches!(table, "mem_memories" | "memory_graph_nodes") {
+            if let Some(user_stores) = routed_user_stores(&store).await? {
+                let mut total = 0i64;
+                for (_, store) in user_stores {
+                    total += SqlMemoryStore::rebuild_vector_index(&store, table).await?;
+                }
+                return Ok(total);
+            }
+        }
+        SqlMemoryStore::rebuild_vector_index(&store, table).await
     }
 
     async fn cleanup_snapshots(&self, keep_last_n: usize) -> Result<i64, MemoriaError> {
-        SqlMemoryStore::cleanup_snapshots(self, keep_last_n).await
+        let store = self.clone();
+        if let Some(user_stores) = routed_user_stores(&store).await? {
+            let mut total = 0i64;
+            for (_, store) in user_stores {
+                total += SqlMemoryStore::cleanup_snapshots(&store, keep_last_n).await?;
+            }
+            return Ok(total);
+        }
+        SqlMemoryStore::cleanup_snapshots(&store, keep_last_n).await
     }
 
     async fn cleanup_orphan_branches(&self) -> Result<i64, MemoriaError> {
-        SqlMemoryStore::cleanup_orphan_branches(self).await
+        let store = self.clone();
+        if let Some(user_stores) = routed_user_stores(&store).await? {
+            let mut total = 0i64;
+            for (_, store) in user_stores {
+                total += SqlMemoryStore::cleanup_orphan_branches(&store).await?;
+            }
+            return Ok(total);
+        }
+        SqlMemoryStore::cleanup_orphan_branches(&store).await
     }
 
     async fn cleanup_orphan_stats(&self) -> Result<i64, MemoriaError> {
-        SqlMemoryStore::cleanup_orphan_stats(self).await
+        let store = self.clone();
+        if let Some(user_stores) = routed_user_stores(&store).await? {
+            let mut total = 0i64;
+            for (_, store) in user_stores {
+                total += SqlMemoryStore::cleanup_orphan_stats(&store).await?;
+            }
+            return Ok(total);
+        }
+        SqlMemoryStore::cleanup_orphan_stats(&store).await
     }
 
     async fn cleanup_orphan_graph_data(&self) -> Result<i64, MemoriaError> {
-        let graph = self.graph_store();
+        let store = self.clone();
+        if let Some(user_stores) = routed_user_stores(&store).await? {
+            let mut total = 0i64;
+            for (_, store) in user_stores {
+                total +=
+                    <SqlMemoryStore as GovernanceStore>::cleanup_orphan_graph_data(&store).await?;
+            }
+            return Ok(total);
+        }
+        let graph = store.graph_store();
         let mut total = 0i64;
         let mut errors = Vec::new();
         // 1. Orphaned mem_entity_links
-        match SqlMemoryStore::cleanup_orphan_entity_links(self).await {
+        match SqlMemoryStore::cleanup_orphan_entity_links(&store).await {
             Ok(n) => total += n,
             Err(e) => errors.push(format!("entity_links: {e}")),
         }
@@ -281,15 +407,59 @@ impl GovernanceStore for SqlMemoryStore {
     }
 
     async fn cleanup_edit_log(&self, retain_days: i64) -> Result<i64, MemoriaError> {
-        SqlMemoryStore::cleanup_edit_log(self, retain_days).await
+        let store = self.clone();
+        if let Some(user_stores) = routed_user_stores(&store).await? {
+            let mut total = 0i64;
+            for (_, store) in user_stores {
+                total += SqlMemoryStore::cleanup_edit_log(&store, retain_days).await?;
+            }
+            return Ok(total);
+        }
+        SqlMemoryStore::cleanup_edit_log(&store, retain_days).await
     }
 
     async fn cleanup_feedback(&self, retain_days: i64) -> Result<i64, MemoriaError> {
-        SqlMemoryStore::cleanup_feedback(self, retain_days).await
+        let store = self.clone();
+        if let Some(user_stores) = routed_user_stores(&store).await? {
+            let mut total = 0i64;
+            for (_, store) in user_stores {
+                total += SqlMemoryStore::cleanup_feedback(&store, retain_days).await?;
+            }
+            return Ok(total);
+        }
+        SqlMemoryStore::cleanup_feedback(&store, retain_days).await
     }
 
     async fn create_safety_snapshot(&self, operation: &str) -> (Option<String>, Option<String>) {
-        SqlMemoryStore::create_safety_snapshot(self, operation).await
+        let store = self.clone();
+        if let Ok(Some(user_stores)) = routed_user_stores(&store).await {
+            let mut created = 0usize;
+            let mut warnings = Vec::new();
+            for (user_id, store) in user_stores {
+                let (snapshot, warning) =
+                    SqlMemoryStore::create_safety_snapshot(&store, operation).await;
+                if snapshot.is_some() {
+                    created += 1;
+                }
+                if let Some(warning) = warning {
+                    warnings.push(format!("{user_id}: {warning}"));
+                }
+            }
+            if created > 0 {
+                let mut summary = format!(
+                    "⚠️ Created per-user governance safety snapshots in {created} user DB(s). \
+                     Rollback requires restoring each affected user DB snapshot separately."
+                );
+                if !warnings.is_empty() {
+                    summary.push_str(&format!(" Warnings: {}", warnings.join(" | ")));
+                }
+                return (Some("multi-db-safety-snapshots".to_string()), Some(summary));
+            }
+            if !warnings.is_empty() {
+                return (None, Some(warnings.join(" | ")));
+            }
+        }
+        SqlMemoryStore::create_safety_snapshot(&store, operation).await
     }
 
     async fn log_edit(
@@ -301,8 +471,9 @@ impl GovernanceStore for SqlMemoryStore {
         reason: &str,
         snapshot_before: Option<&str>,
     ) {
+        let store = self.clone();
         SqlMemoryStore::log_edit(
-            self,
+            &store,
             user_id,
             operation,
             memory_id,
@@ -349,8 +520,17 @@ impl GovernanceStore for SqlMemoryStore {
     async fn tune_user_retrieval_params(&self, user_id: &str) -> Result<bool, MemoriaError> {
         use crate::scoring::{DefaultScoringPlugin, ScoringPlugin};
 
+        let store = self.clone();
+        if let Some(user_store) = routed_user_store(&store, user_id)? {
+            return <SqlMemoryStore as GovernanceStore>::tune_user_retrieval_params(
+                &user_store,
+                user_id,
+            )
+            .await;
+        }
+
         let plugin = DefaultScoringPlugin;
-        match plugin.tune_params(self, user_id).await? {
+        match plugin.tune_params(&store, user_id).await? {
             Some(_) => Ok(true),
             None => Ok(false),
         }
@@ -1310,8 +1490,14 @@ fn governance_decision(
         confidence,
         rationale,
         evidence,
-        rollback_hint: snapshot_before
-            .map(|snapshot| format!("Restore affected tables from snapshot {snapshot}")),
+        rollback_hint: snapshot_before.map(|snapshot| {
+            if snapshot == "multi-db-safety-snapshots" {
+                "Restore each affected user DB from its per-user governance safety snapshot."
+                    .to_string()
+            } else {
+                format!("Restore affected tables from snapshot {snapshot}")
+            }
+        }),
     }
 }
 

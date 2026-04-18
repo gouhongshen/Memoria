@@ -79,30 +79,54 @@ impl GovernanceScheduler {
 
         // Create an isolated pool for governance so long-running operations
         // (consolidation, cleanup, DDL rebuilds) do not starve request connections.
+        let default_governance_pool_size = if service.db_router.is_some() { 2 } else { 4 };
+        let governance_pool_size: u32 = std::env::var("GOVERNANCE_POOL_SIZE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(default_governance_pool_size)
+            .min(32);
         #[allow(clippy::type_complexity)]
         let (gov_store, gov_sql_store, lock): (
             Option<Arc<dyn GovernanceStore>>,
             Option<Arc<SqlMemoryStore>>,
             Arc<dyn DistributedLock>,
         ) = match &service.sql_store {
-            Some(store) => match store.spawn_background_store(4).await {
-                Ok(bg) => {
-                    info!("Governance scheduler using isolated pool (4 connections)");
-                    (
-                        Some(bg.clone() as Arc<dyn GovernanceStore>),
-                        Some(bg.clone()),
-                        bg as Arc<dyn DistributedLock>,
-                    )
-                }
-                Err(e) => {
-                    warn!(error = %e, "Governance isolated pool failed, falling back to main pool");
+            Some(store) => {
+                if governance_pool_size == 0 {
+                    info!("Governance isolated pool disabled; falling back to main pool");
                     (
                         Some(store.clone() as Arc<dyn GovernanceStore>),
                         Some(store.clone()),
                         store.clone() as Arc<dyn DistributedLock>,
                     )
+                } else {
+                    match store.spawn_background_store(governance_pool_size).await {
+                        Ok(bg) => {
+                            info!(
+                                governance_pool_size,
+                                "Governance scheduler using isolated pool"
+                            );
+                            (
+                                Some(bg.clone() as Arc<dyn GovernanceStore>),
+                                Some(bg.clone()),
+                                bg as Arc<dyn DistributedLock>,
+                            )
+                        }
+                        Err(e) => {
+                            warn!(
+                                error = %e,
+                                governance_pool_size,
+                                "Governance isolated pool failed, falling back to main pool"
+                            );
+                            (
+                                Some(store.clone() as Arc<dyn GovernanceStore>),
+                                Some(store.clone()),
+                                store.clone() as Arc<dyn DistributedLock>,
+                            )
+                        }
+                    }
                 }
-            },
+            }
             None => (
                 None,
                 None,
@@ -1359,6 +1383,8 @@ mod tests {
         let config = Config {
             db_url: "mysql://root:111@localhost:6001/memoria".into(),
             db_name: "memoria".into(),
+            shared_db_url: "mysql://root:111@localhost:6001/memoria_shared".into(),
+            multi_db: false,
             embedding_provider: "mock".into(),
             embedding_model: "BAAI/bge-m3".into(),
             embedding_dim: 1024,
@@ -1374,6 +1400,7 @@ mod tests {
             governance_plugin_dir: None,
             instance_id: "test-instance".into(),
             lock_ttl_secs: 120,
+            ops_metrics_enabled: false,
         };
         let scheduler = tokio::runtime::Runtime::new()
             .unwrap()

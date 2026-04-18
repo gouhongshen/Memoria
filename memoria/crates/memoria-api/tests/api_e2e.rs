@@ -48,6 +48,52 @@ async fn spawn_fake_llm() -> (
     memoria_test_utils::spawn_fake_llm(episodic_rules()).await
 }
 
+struct SessionScopeTestEmbedder;
+
+impl SessionScopeTestEmbedder {
+    fn vector_for(text: &str) -> Vec<f32> {
+        let mut v = vec![0.0; test_dim()];
+        match text {
+            "strict session query" | "other-session top" => v[0] = 1.0,
+            "scoped topk query" | "global-candidate-a" => v[0] = 1.0,
+            "other-session second" => {
+                v[0] = 0.98;
+                v[1] = 0.02;
+            }
+            "global-candidate-b" => {
+                v[0] = 0.97;
+                v[1] = 0.03;
+            }
+            "target-session memory" => v[1] = 1.0,
+            "scoped-candidate-a" => {
+                v[0] = 0.6;
+                v[1] = 0.4;
+            }
+            "target-session backup" => {
+                v[1] = 0.97;
+                v[2] = 0.03;
+            }
+            "scoped-candidate-b" => {
+                v[0] = 0.3;
+                v[1] = 0.7;
+            }
+            _ => v[2] = 1.0,
+        }
+        v
+    }
+}
+
+#[async_trait::async_trait]
+impl memoria_core::interfaces::EmbeddingProvider for SessionScopeTestEmbedder {
+    async fn embed(&self, text: &str) -> Result<Vec<f32>, memoria_core::MemoriaError> {
+        Ok(Self::vector_for(text))
+    }
+
+    fn dimension(&self) -> usize {
+        test_dim()
+    }
+}
+
 /// Returns (key, base_url, model) if EMBEDDING_API_KEY is set, else None.
 fn try_embedding() -> Option<(String, String, String)> {
     let key = std::env::var("EMBEDDING_API_KEY")
@@ -867,7 +913,7 @@ async fn spawn_server_with_master_key(master_key: &str) -> (String, reqwest::Cli
     let git = Arc::new(GitForDataService::new(pool, &cfg.db_name));
     let service = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), None, None).await);
     let state = memoria_api::AppState::new(service, git, master_key.to_string())
-        .init_auth_pool(&db)
+        .init_auth_pool(&db, false)
         .await
         .expect("init auth pool");
     let app = memoria_api::build_router(state);
@@ -2408,6 +2454,91 @@ async fn test_remote_purge_by_topic() {
     println!("✅ remote purge by topic: {t}");
 }
 
+#[tokio::test]
+async fn test_remote_purge_by_session_id() {
+    use memoria_mcp::remote::RemoteClient;
+    let (base, _) = spawn_api_for_remote().await;
+    let uid = uid();
+    let remote = RemoteClient::new(&base, None, uid.clone(), None);
+    let target_session = format!("session:test-smp-{}", uuid::Uuid::new_v4().simple());
+    let other_session = format!("session:test-smp-{}", uuid::Uuid::new_v4().simple());
+
+    remote
+        .call(
+            "memory_store",
+            json!({"content": "remote working alpha", "memory_type": "working", "session_id": target_session}),
+        )
+        .await
+        .unwrap();
+    remote
+        .call(
+            "memory_store",
+            json!({"content": "remote working beta", "memory_type": "working", "session_id": target_session}),
+        )
+        .await
+        .unwrap();
+    remote
+        .call(
+            "memory_store",
+            json!({"content": "remote semantic keep", "memory_type": "semantic", "session_id": target_session}),
+        )
+        .await
+        .unwrap();
+    remote
+        .call(
+            "memory_store",
+            json!({"content": "remote other keep", "memory_type": "working", "session_id": other_session}),
+        )
+        .await
+        .unwrap();
+
+    let r = remote
+        .call(
+            "memory_purge",
+            json!({"session_id": target_session, "memory_types": ["working"]}),
+        )
+        .await
+        .unwrap();
+    let t = r["content"][0]["text"].as_str().unwrap_or("");
+    assert!(t.contains("Purged 2"), "got: {t}");
+
+    let list = remote
+        .call("memory_list", json!({"limit": 10}))
+        .await
+        .unwrap();
+    let list_text = list["content"][0]["text"].as_str().unwrap_or("");
+    assert!(
+        list_text.contains("remote semantic keep"),
+        "got: {list_text}"
+    );
+    assert!(list_text.contains("remote other keep"), "got: {list_text}");
+    assert!(
+        !list_text.contains("remote working alpha"),
+        "got: {list_text}"
+    );
+    assert!(
+        !list_text.contains("remote working beta"),
+        "got: {list_text}"
+    );
+    println!("✅ remote purge by session_id: {t}");
+}
+
+#[tokio::test]
+async fn test_remote_purge_rejects_invalid_memory_types_locally() {
+    use memoria_mcp::remote::RemoteClient;
+    let remote = RemoteClient::new("http://127.0.0.1:9", None, uid(), None);
+
+    let err = remote
+        .call(
+            "memory_purge",
+            json!({"session_id": "sess-target", "memory_types": ["not_a_real_type"]}),
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("Invalid memory type"), "{err}");
+    println!("✅ remote purge rejects invalid memory_types before API call");
+}
+
 // ── Episodic memory tests ─────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -2493,6 +2624,55 @@ async fn spawn_server_with_embedding(
     tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
     (format!("http://127.0.0.1:{port}"), client)
+}
+
+async fn spawn_server_with_custom_embedder_and_pool(
+    embedder: Arc<dyn memoria_core::interfaces::EmbeddingProvider>,
+    dim: usize,
+) -> (String, reqwest::Client, sqlx::MySqlPool) {
+    use memoria_git::GitForDataService;
+    use memoria_service::{Config, MemoryService};
+    use memoria_storage::SqlMemoryStore;
+
+    let cfg = Config::from_env();
+    let db = db_url();
+    let store = SqlMemoryStore::connect(&db, dim, uuid::Uuid::new_v4().to_string())
+        .await
+        .expect("connect");
+    store.migrate().await.expect("migrate");
+    let pool = store.pool().clone();
+    let git = Arc::new(GitForDataService::new(pool.clone(), &cfg.db_name));
+    let service =
+        Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), Some(embedder), None).await);
+    let state = memoria_api::AppState::new(service, git, String::new());
+    let app = memoria_api::build_router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    (format!("http://127.0.0.1:{port}"), client, pool)
+}
+
+async fn store_memory_for_session(
+    client: &reqwest::Client,
+    base: &str,
+    user_id: &str,
+    content: &str,
+    session_id: &str,
+) -> String {
+    let r = client
+        .post(format!("{base}/v1/memories"))
+        .header("X-User-Id", user_id)
+        .json(&json!({"content": content, "session_id": session_id}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
+    r.json::<Value>().await.unwrap()["memory_id"]
+        .as_str()
+        .unwrap()
+        .to_string()
 }
 
 #[tokio::test]
@@ -3093,6 +3273,222 @@ async fn test_explain_verbose_candidate_scores() {
 }
 
 #[tokio::test]
+async fn test_retrieve_filter_session_prefilters_and_skips_graph() {
+    use memoria_storage::{GraphEdge, GraphNode, GraphStore, NodeType};
+
+    let (base, client, pool) =
+        spawn_server_with_custom_embedder_and_pool(Arc::new(SessionScopeTestEmbedder), test_dim())
+            .await;
+    let uid = uid();
+
+    let target_mid =
+        store_memory_for_session(&client, &base, &uid, "target-session memory", "sess-target")
+            .await;
+    let other_mid =
+        store_memory_for_session(&client, &base, &uid, "other-session top", "sess-other").await;
+    let other_second_mid =
+        store_memory_for_session(&client, &base, &uid, "other-session second", "sess-other").await;
+
+    let graph = GraphStore::new(pool, test_dim());
+    graph.migrate().await.expect("graph migrate");
+
+    let make_node = |memory_id: &str, session_id: &str, content: &str| GraphNode {
+        node_id: uuid::Uuid::new_v4().simple().to_string()[..32].to_string(),
+        user_id: uid.clone(),
+        node_type: NodeType::Semantic,
+        content: content.to_string(),
+        entity_type: None,
+        embedding: Some(SessionScopeTestEmbedder::vector_for(content)),
+        memory_id: Some(memory_id.to_string()),
+        session_id: Some(session_id.to_string()),
+        confidence: 0.95,
+        trust_tier: "T1".to_string(),
+        importance: 0.5,
+        source_nodes: vec![],
+        conflicts_with: None,
+        conflict_resolution: None,
+        access_count: 0,
+        cross_session_count: 0,
+        is_active: true,
+        superseded_by: None,
+        created_at: Some(chrono::Utc::now().naive_utc()),
+    };
+
+    let target_node = make_node(&target_mid, "sess-target", "target-session memory");
+    let other_node = make_node(&other_mid, "sess-other", "other-session top");
+    let other_second_node = make_node(&other_second_mid, "sess-other", "other-session second");
+    graph.create_node(&target_node).await.unwrap();
+    graph.create_node(&other_node).await.unwrap();
+    graph.create_node(&other_second_node).await.unwrap();
+    graph
+        .add_edge(&GraphEdge {
+            source_id: other_node.node_id.clone(),
+            target_id: other_second_node.node_id.clone(),
+            edge_type: "association".to_string(),
+            weight: 1.0,
+            user_id: uid.clone(),
+        })
+        .await
+        .unwrap();
+
+    let relaxed = client
+        .post(format!("{base}/v1/memories/retrieve"))
+        .header("X-User-Id", &uid)
+        .json(&json!({
+            "query": "strict session query",
+            "session_id": "sess-target",
+            "top_k": 1,
+            "explain": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(relaxed.status(), 200);
+    let relaxed_body: Value = relaxed.json().await.unwrap();
+    assert_eq!(relaxed_body["explain"]["graph_attempted"], true);
+    assert_eq!(
+        relaxed_body["results"][0]["session_id"].as_str(),
+        Some("sess-other"),
+        "cross-session retrieval should still be free to return another session",
+    );
+
+    let strict = client
+        .post(format!("{base}/v1/memories/retrieve"))
+        .header("X-User-Id", &uid)
+        .json(&json!({
+            "query": "strict session query",
+            "session_id": "sess-target",
+            "filter_session": true,
+            "top_k": 1,
+            "explain": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(strict.status(), 200);
+    let strict_body: Value = strict.json().await.unwrap();
+    assert_eq!(strict_body["explain"]["graph_attempted"], false);
+    assert_ne!(strict_body["explain"]["path"], "graph");
+    assert_eq!(
+        strict_body["results"][0]["memory_id"].as_str(),
+        Some(target_mid.as_str()),
+        "strict session retrieval should pre-filter tabular candidates before ranking",
+    );
+
+    let legacy = client
+        .post(format!("{base}/v1/memories/retrieve"))
+        .header("X-User-Id", &uid)
+        .json(&json!({
+            "query": "strict session query",
+            "session_id": "sess-target",
+            "include_cross_session": false,
+            "top_k": 1
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(legacy.status(), 200);
+    let legacy_body: Value = legacy.json().await.unwrap();
+    assert_eq!(
+        legacy_body[0]["memory_id"].as_str(),
+        Some(target_mid.as_str()),
+        "legacy include_cross_session=false should keep strict session semantics",
+    );
+}
+
+#[tokio::test]
+async fn test_retrieve_filter_session_requires_session_id() {
+    let (base, client) = spawn_server().await;
+    let user = uid();
+
+    let r = client
+        .post(format!("{base}/v1/memories/retrieve"))
+        .header("X-User-Id", &user)
+        .json(&json!({
+            "query": "strict session query",
+            "filter_session": true,
+            "top_k": 1
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 422);
+
+    let r = client
+        .post(format!("{base}/v1/memories/retrieve"))
+        .header("X-User-Id", &user)
+        .json(&json!({
+            "query": "strict session query",
+            "include_cross_session": false,
+            "top_k": 1
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 422);
+}
+
+#[tokio::test]
+async fn test_retrieve_filter_session_preserves_top_k_with_session_candidates() {
+    let (base, client, _pool) =
+        spawn_server_with_custom_embedder_and_pool(Arc::new(SessionScopeTestEmbedder), test_dim())
+            .await;
+    let uid = uid();
+
+    let target_first =
+        store_memory_for_session(&client, &base, &uid, "scoped-candidate-a", "sess-target").await;
+    let target_second =
+        store_memory_for_session(&client, &base, &uid, "scoped-candidate-b", "sess-target").await;
+    let _other_first =
+        store_memory_for_session(&client, &base, &uid, "global-candidate-a", "sess-other").await;
+    let _other_second =
+        store_memory_for_session(&client, &base, &uid, "global-candidate-b", "sess-other").await;
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+    let strict = client
+        .post(format!("{base}/v1/memories/retrieve"))
+        .header("X-User-Id", &uid)
+        .json(&json!({
+            "query": "scoped topk query",
+            "session_id": "sess-target",
+            "filter_session": true,
+            "top_k": 2
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(strict.status(), 200);
+    let strict_body: Value = strict.json().await.unwrap();
+    let strict_results = strict_body
+        .as_array()
+        .expect("retrieve should return array");
+    assert_eq!(
+        strict_results.len(),
+        2,
+        "strict session retrieval should still fill top_k from session-local candidates",
+    );
+    assert_eq!(
+        strict_results[0]["session_id"].as_str(),
+        Some("sess-target"),
+        "strict session retrieval must only return target-session memories",
+    );
+    assert_eq!(
+        strict_results[1]["session_id"].as_str(),
+        Some("sess-target"),
+        "strict session retrieval must only return target-session memories",
+    );
+    let strict_ids: std::collections::HashSet<&str> = strict_results
+        .iter()
+        .filter_map(|item| item["memory_id"].as_str())
+        .collect();
+    assert_eq!(
+        strict_ids,
+        std::collections::HashSet::from([target_first.as_str(), target_second.as_str()]),
+        "strict retrieval should pre-filter before ranking instead of post-filtering a global top_k",
+    );
+}
+
+#[tokio::test]
 async fn test_pipeline_run() {
     let (base, client) = spawn_server().await;
     let user = uid();
@@ -3340,15 +3736,22 @@ async fn test_snapshot_get_detail() {
     let uid = uid();
 
     // Store memories
-    for content in [
-        "snapshot detail A",
-        "snapshot detail B",
-        "snapshot detail C",
+    for (content, trust_tier, initial_confidence, observed_at) in [
+        ("snapshot detail A", "T1", 0.91, "2026-04-01T10:00:00Z"),
+        ("snapshot detail B", "T2", 0.82, "2026-04-02T10:00:00Z"),
+        ("snapshot detail C", "T3", 0.73, "2026-04-03T10:00:00Z"),
     ] {
         client
             .post(format!("{base}/v1/memories"))
             .header("X-User-Id", &uid)
-            .json(&json!({"content": content, "memory_type": "semantic"}))
+            .json(&json!({
+                "content": content,
+                "memory_type": "semantic",
+                "trust_tier": trust_tier,
+                "initial_confidence": initial_confidence,
+                "session_id": "snapshot-detail-session",
+                "observed_at": observed_at
+            }))
             .send()
             .await
             .unwrap();
@@ -3381,11 +3784,34 @@ async fn test_snapshot_get_detail() {
     assert!(body["by_type"]["semantic"].as_i64().unwrap() >= 3);
     let mems = body["memories"].as_array().unwrap();
     assert_eq!(mems.len(), 3);
+    let mut tiers: Vec<_> = mems
+        .iter()
+        .map(|m| m["trust_tier"].as_str().unwrap_or_default().to_string())
+        .collect();
+    tiers.sort();
+    assert_eq!(tiers, vec!["T1", "T2", "T3"]);
     // Brief mode: content should be short
     for m in mems {
         assert!(m["memory_id"].as_str().is_some());
+        assert_eq!(m["user_id"], uid);
         assert!(m["content"].as_str().is_some());
         assert_eq!(m["memory_type"], "semantic");
+        assert!(m["initial_confidence"].is_number());
+        assert_eq!(m["is_active"], true);
+        assert_eq!(m["session_id"], "snapshot-detail-session");
+        assert!(m["observed_at"].as_str().is_some());
+        assert!(
+            m["created_at"].as_str().is_some(),
+            "brief mode should include created_at"
+        );
+        assert!(
+            m["trust_tier"].as_str().is_some(),
+            "brief mode should include trust_tier"
+        );
+        assert!(
+            m.get("retrieval_score").is_some(),
+            "brief mode should include retrieval_score"
+        );
     }
     println!(
         "✅ GET /v1/snapshots/:name (brief): {} memories, by_type={}",
@@ -3407,6 +3833,26 @@ async fn test_snapshot_get_detail() {
         mems[0].get("confidence").is_some(),
         "full detail should include confidence: {}",
         mems[0]
+    );
+    assert!(
+        mems.iter().all(|m| m["trust_tier"].as_str().is_some()),
+        "full detail should include trust_tier: {body}"
+    );
+    assert!(
+        mems.iter().all(|m| m["created_at"].as_str().is_some()),
+        "full detail should include created_at: {body}"
+    );
+    assert!(
+        mems.iter().all(|m| m["observed_at"].as_str().is_some()),
+        "full detail should include observed_at: {body}"
+    );
+    assert!(
+        mems.iter().all(|m| m["initial_confidence"].is_number()),
+        "full detail should include initial_confidence: {body}"
+    );
+    assert!(
+        mems.iter().all(|m| m.get("retrieval_score").is_some()),
+        "full detail should include retrieval_score: {body}"
     );
     println!("✅ GET /v1/snapshots/:name (full): confidence present");
 
@@ -3454,11 +3900,11 @@ async fn test_snapshot_diff() {
 
     // Store 2 memories
     let mut mids = vec![];
-    for content in ["diff base A", "diff base B"] {
+    for (content, trust_tier) in [("diff base A", "T1"), ("diff base B", "T2")] {
         let r = client
             .post(format!("{base}/v1/memories"))
             .header("X-User-Id", &uid)
-            .json(&json!({"content": content}))
+            .json(&json!({"content": content, "trust_tier": trust_tier}))
             .send()
             .await
             .unwrap();
@@ -3487,7 +3933,7 @@ async fn test_snapshot_diff() {
     client
         .post(format!("{base}/v1/memories"))
         .header("X-User-Id", &uid)
-        .json(&json!({"content": "diff added C"}))
+        .json(&json!({"content": "diff added C", "trust_tier": "T3"}))
         .send()
         .await
         .unwrap();
@@ -3524,12 +3970,20 @@ async fn test_snapshot_diff() {
             .any(|m| m["content"].as_str().unwrap().contains("diff added C")),
         "should find added memory: {added:?}"
     );
+    assert!(
+        added.iter().any(|m| m["trust_tier"] == "T3"),
+        "added diff entries should include trust_tier: {added:?}"
+    );
     // "diff base A" should be in removed (deleted after snapshot)
     assert!(
         removed
             .iter()
             .any(|m| m["content"].as_str().unwrap().contains("diff base A")),
         "should find removed memory: {removed:?}"
+    );
+    assert!(
+        removed.iter().any(|m| m["trust_tier"] == "T1"),
+        "removed diff entries should include trust_tier: {removed:?}"
     );
     println!(
         "✅ GET /v1/snapshots/:name/diff: added={}, removed={}",
@@ -3643,6 +4097,9 @@ async fn test_api_snapshot_limit_is_per_user() {
             result.contains("created"),
             "snapshot create failed: {result}"
         );
+        assert_eq!(body["name"], name.as_str());
+        assert!(body["created_at"].is_string(), "missing created_at: {body}");
+        assert!(body["timestamp"].is_string(), "missing timestamp: {body}");
     }
 
     let overflow = format!(
@@ -3693,6 +4150,7 @@ async fn test_api_snapshot_limit_is_per_user() {
     assert_eq!(r.status(), 200);
     let body: Value = r.json().await.unwrap();
     let listed = body["result"].as_str().unwrap_or("");
+    let snapshots = body["snapshots"].as_array().expect("snapshots array");
     assert!(
         listed.contains(&b_snap),
         "B should see own snapshot: {listed}"
@@ -3700,6 +4158,16 @@ async fn test_api_snapshot_limit_is_per_user() {
     assert!(
         !listed.contains(&names_a[0]),
         "B should not see A's snapshots: {listed}"
+    );
+    assert!(
+        snapshots.iter().any(|snapshot| snapshot["name"] == b_snap),
+        "B should see own snapshot in structured list: {body}"
+    );
+    assert!(
+        snapshots
+            .iter()
+            .all(|snapshot| snapshot["name"] != names_a[0]),
+        "B structured list should not see A's snapshots: {body}"
     );
 
     client
@@ -4006,6 +4474,26 @@ async fn test_remote_snapshot_detail_and_diff() {
     assert_eq!(r.status(), 200);
     let body: Value = r.json().await.unwrap();
     assert_eq!(body["memory_count"], 2, "snapshot should have 2 memories");
+    assert!(
+        body["memories"].as_array().unwrap().iter().all(|m| {
+            m["user_id"] == uid
+                && m["initial_confidence"].is_number()
+                && m["is_active"] == true
+                && m.get("session_id").is_some()
+                && m["observed_at"].as_str().is_some()
+                && m["trust_tier"].as_str().is_some()
+                && m.get("retrieval_score").is_some()
+        }),
+        "remote snapshot detail should align with MemoryResponse metadata: {body}"
+    );
+    assert!(
+        body["memories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|m| m["created_at"].as_str().is_some()),
+        "remote snapshot detail should include created_at: {body}"
+    );
     println!(
         "✅ remote snapshot detail: memory_count={}",
         body["memory_count"]
@@ -5228,6 +5716,66 @@ async fn test_api_snapshot_rollback() {
     println!("✅ POST /v1/snapshots/:name/rollback: {}", body["result"]);
 }
 
+#[tokio::test]
+async fn test_api_branch_list_returns_structured_json() {
+    let (base, client) = spawn_server().await;
+    let uid = uid();
+    let branch = format!(
+        "api_branch_{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..6]
+    );
+
+    let r = client
+        .post(format!("{base}/v1/branches"))
+        .header("X-User-Id", &uid)
+        .json(&json!({ "name": branch }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
+
+    let r = client
+        .post(format!("{base}/v1/branches/{branch}/checkout"))
+        .header("X-User-Id", &uid)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+
+    let r = client
+        .get(format!("{base}/v1/branches"))
+        .header("X-User-Id", &uid)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+    let branches = body["branches"].as_array().expect("branches array");
+    assert!(
+        branches
+            .iter()
+            .any(|entry| entry["name"] == "main" && entry["active"] == false),
+        "main branch should be present and inactive after checkout: {body}"
+    );
+    assert!(
+        branches
+            .iter()
+            .any(|entry| entry["name"] == branch && entry["active"] == true),
+        "checked out branch should be marked active: {body}"
+    );
+    assert!(
+        body["result"].as_str().unwrap_or("").contains("Branches:"),
+        "compat text should still be present: {body}"
+    );
+
+    client
+        .delete(format!("{base}/v1/branches/{branch}"))
+        .header("X-User-Id", &uid)
+        .send()
+        .await
+        .unwrap();
+}
+
 // ── Entity list ───────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -5667,7 +6215,7 @@ async fn test_api_key_auth_uses_batcher_not_fire_and_forget() {
     let git = Arc::new(GitForDataService::new(pool, &cfg.db_name));
     let service = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), None, None).await);
     let state = memoria_api::AppState::new(service, git, mk.to_string())
-        .init_auth_pool(&db)
+        .init_auth_pool(&db, false)
         .await
         .expect("auth pool");
 
@@ -6210,6 +6758,10 @@ async fn mcp_post_with_headers(
         .expect("parse json")
 }
 
+fn mcp_result_text(resp: &Value) -> &str {
+    resp["result"]["content"][0]["text"].as_str().unwrap_or("")
+}
+
 #[tokio::test]
 async fn test_mcp_initialize() {
     let (base, client) = spawn_server().await;
@@ -6295,6 +6847,187 @@ async fn test_mcp_tools_call_memory_store() {
     let text = resp["result"]["content"][0]["text"].as_str().unwrap_or("");
     assert!(text.contains("Stored"), "expected 'Stored' in: {text}");
     println!("✅ POST /mcp tools/call memory_store: {text}");
+}
+
+#[tokio::test]
+async fn test_mcp_memory_retrieve_filter_session_end_to_end() {
+    let (base, client, _pool) =
+        spawn_server_with_custom_embedder_and_pool(Arc::new(SessionScopeTestEmbedder), test_dim())
+            .await;
+    let uid = uid();
+    let headers = [("X-User-Id", uid.as_str())];
+
+    for (id, content, session_id) in [
+        (11, "target-session memory", "sess-target"),
+        (12, "other-session top", "sess-other"),
+        (13, "other-session second", "sess-other"),
+    ] {
+        let resp = mcp_post_with_headers(
+            &client,
+            &base,
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": {
+                    "name": "memory_store",
+                    "arguments": {
+                        "content": content,
+                        "memory_type": "semantic",
+                        "session_id": session_id
+                    }
+                }
+            }),
+            &headers,
+        )
+        .await;
+        assert!(
+            resp["error"].is_null(),
+            "unexpected store error: {}",
+            resp["error"]
+        );
+    }
+
+    let relaxed = mcp_post_with_headers(
+        &client,
+        &base,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 14,
+            "method": "tools/call",
+            "params": {
+                "name": "memory_retrieve",
+                "arguments": {
+                    "query": "strict session query",
+                    "session_id": "sess-target",
+                    "top_k": 1
+                }
+            }
+        }),
+        &headers,
+    )
+    .await;
+    assert!(
+        relaxed["error"].is_null(),
+        "unexpected relaxed error: {}",
+        relaxed["error"]
+    );
+    let relaxed_text = mcp_result_text(&relaxed);
+    assert!(
+        relaxed_text.contains("other-session"),
+        "relaxed MCP retrieve should still be free to return cross-session memory: {relaxed_text}"
+    );
+
+    let strict = mcp_post_with_headers(
+        &client,
+        &base,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 15,
+            "method": "tools/call",
+            "params": {
+                "name": "memory_retrieve",
+                "arguments": {
+                    "query": "strict session query",
+                    "session_id": "sess-target",
+                    "filter_session": true,
+                    "top_k": 1
+                }
+            }
+        }),
+        &headers,
+    )
+    .await;
+    assert!(
+        strict["error"].is_null(),
+        "unexpected strict error: {}",
+        strict["error"]
+    );
+    let strict_text = mcp_result_text(&strict);
+    assert!(
+        strict_text.contains("target-session memory"),
+        "strict MCP retrieve should return the target-session memory: {strict_text}"
+    );
+    assert!(
+        !strict_text.contains("other-session top"),
+        "strict MCP retrieve should not leak cross-session memory: {strict_text}"
+    );
+
+    let legacy = mcp_post_with_headers(
+        &client,
+        &base,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 16,
+            "method": "tools/call",
+            "params": {
+                "name": "memory_retrieve",
+                "arguments": {
+                    "query": "strict session query",
+                    "session_id": "sess-target",
+                    "include_cross_session": false,
+                    "top_k": 1
+                }
+            }
+        }),
+        &headers,
+    )
+    .await;
+    assert!(
+        legacy["error"].is_null(),
+        "unexpected legacy error: {}",
+        legacy["error"]
+    );
+    let legacy_text = mcp_result_text(&legacy);
+    assert!(
+        legacy_text.contains("target-session memory"),
+        "legacy MCP retrieve flag should still enforce session scope: {legacy_text}"
+    );
+}
+
+#[tokio::test]
+async fn test_mcp_tools_call_records_tool_usage() {
+    let (base, client) = spawn_server().await;
+    let uid = uid();
+
+    let resp = mcp_post_with_headers(
+        &client,
+        &base,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {
+                "name": "memory_store",
+                "arguments": {"content": "mcp tool usage tracked", "memory_type": "semantic"}
+            }
+        }),
+        &[("X-User-Id", uid.as_str())],
+    )
+    .await;
+
+    assert!(
+        resp["error"].is_null(),
+        "unexpected error: {}",
+        resp["error"]
+    );
+
+    let usage: Value = client
+        .get(format!("{base}/v1/tool-usage"))
+        .header("X-User-Id", &uid)
+        .send()
+        .await
+        .expect("send")
+        .json()
+        .await
+        .expect("parse");
+
+    let items = usage.as_array().expect("usage array");
+    assert!(
+        items.iter().any(|item| item["tool_name"] == "memory_store"),
+        "memory_store missing from tool usage: {usage}"
+    );
+    println!("✅ POST /mcp tools/call records tool usage");
 }
 
 #[tokio::test]

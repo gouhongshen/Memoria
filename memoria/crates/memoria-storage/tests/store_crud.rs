@@ -197,6 +197,182 @@ async fn test_search_vector() {
     println!("✅ search_vector: nearest={}", results[0].memory_id);
 }
 
+#[tokio::test]
+async fn test_search_vector_sets_retrieval_score() {
+    let (store, uid) = setup().await;
+
+    sqlx::query("DELETE FROM mem_memories WHERE user_id = ?")
+        .bind(&uid)
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+    let mut near = make_memory(&format!("vec-score-1-{uid}"), "near query", &uid);
+    near.embedding = Some(dim_vec(0, 1.0));
+    let mut far = make_memory(&format!("vec-score-2-{uid}"), "far query", &uid);
+    far.embedding = Some(dim_vec(1, 1.0));
+
+    store.insert(&near).await.unwrap();
+    store.insert(&far).await.unwrap();
+
+    let results = store
+        .search_vector(&uid, &dim_vec(0, 1.0), 2)
+        .await
+        .expect("vector search");
+
+    assert!(!results.is_empty(), "Expected vector search results");
+    let top_score = results[0]
+        .retrieval_score
+        .expect("vector search should propagate similarity score");
+    assert!(
+        top_score > 0.0,
+        "retrieval_score should reflect vector similarity, got {top_score}"
+    );
+    println!("✅ search_vector_sets_retrieval_score: top_score={top_score:.4}");
+}
+
+#[tokio::test]
+async fn test_search_vector_from_filtered_scoped_prefilters_by_session() {
+    let (store, uid) = setup().await;
+
+    sqlx::query("DELETE FROM mem_memories WHERE user_id = ?")
+        .bind(&uid)
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+    let mut target = make_memory(&format!("vec-scope-1-{uid}"), "target session", &uid);
+    target.session_id = Some("sess-target".to_string());
+    target.embedding = Some(dim_vec(1, 1.0));
+
+    let mut other = make_memory(&format!("vec-scope-2-{uid}"), "other session", &uid);
+    other.session_id = Some("sess-other".to_string());
+    other.embedding = Some(dim_vec(0, 1.0));
+
+    store.insert(&target).await.unwrap();
+    store.insert(&other).await.unwrap();
+
+    let global = store
+        .search_vector_from_filtered_scoped("mem_memories", &uid, &dim_vec(0, 1.0), 1, None, None)
+        .await
+        .expect("global vector search");
+    assert_eq!(
+        global.first().map(|m| m.memory_id.as_str()),
+        Some(other.memory_id.as_str()),
+        "global search should return the nearest cross-session memory",
+    );
+
+    let scoped = store
+        .search_vector_from_filtered_scoped(
+            "mem_memories",
+            &uid,
+            &dim_vec(0, 1.0),
+            1,
+            None,
+            Some("sess-target"),
+        )
+        .await
+        .expect("session-scoped vector search");
+    assert_eq!(
+        scoped.len(),
+        1,
+        "strict session search should still return a candidate"
+    );
+    assert_eq!(
+        scoped.first().map(|m| m.memory_id.as_str()),
+        Some(target.memory_id.as_str()),
+        "strict session search should pre-filter candidates before ranking",
+    );
+}
+
+#[tokio::test]
+async fn test_search_vector_from_filtered_scoped_fills_limit_with_session_candidates() {
+    let (store, uid) = setup().await;
+
+    let mk_vec = |x: f32, y: f32| {
+        let mut v = vec![0.0; test_dim()];
+        v[0] = x;
+        v[1] = y;
+        v
+    };
+
+    let mut target_a = make_memory(&format!("vec-scope-fill-1-{uid}"), "scoped a", &uid);
+    target_a.session_id = Some("sess-target".to_string());
+    target_a.embedding = Some(mk_vec(0.7, 0.3));
+
+    let mut target_b = make_memory(&format!("vec-scope-fill-2-{uid}"), "scoped b", &uid);
+    target_b.session_id = Some("sess-target".to_string());
+    target_b.embedding = Some(mk_vec(0.65, 0.35));
+
+    let mut other_a = make_memory(&format!("vec-scope-fill-3-{uid}"), "global a", &uid);
+    other_a.session_id = Some("sess-other".to_string());
+    other_a.embedding = Some(mk_vec(1.0, 0.0));
+
+    let mut other_b = make_memory(&format!("vec-scope-fill-4-{uid}"), "global b", &uid);
+    other_b.session_id = Some("sess-other".to_string());
+    other_b.embedding = Some(mk_vec(0.97, 0.03));
+
+    store.insert(&target_a).await.unwrap();
+    store.insert(&target_b).await.unwrap();
+    store.insert(&other_a).await.unwrap();
+    store.insert(&other_b).await.unwrap();
+
+    let scoped = store
+        .search_vector_from_filtered_scoped(
+            "mem_memories",
+            &uid,
+            &mk_vec(1.0, 0.0),
+            2,
+            None,
+            Some("sess-target"),
+        )
+        .await
+        .expect("session-scoped vector search");
+    assert_eq!(
+        scoped.len(),
+        2,
+        "strict session search should fill top_k from the filtered session candidate set",
+    );
+    let scoped_ids: std::collections::HashSet<&str> =
+        scoped.iter().map(|m| m.memory_id.as_str()).collect();
+    assert_eq!(
+        scoped_ids,
+        std::collections::HashSet::from([target_a.memory_id.as_str(), target_b.memory_id.as_str()]),
+        "strict session vector search should return both session-local candidates",
+    );
+}
+
+#[tokio::test]
+async fn test_search_hybrid_access_count_stays_tiebreaker() {
+    let (store, uid) = setup().await;
+
+    let mut relevant = make_memory(&format!("hybrid-relevant-{uid}"), "fresh relevant", &uid);
+    relevant.embedding = Some(dim_vec(0, 1.0));
+
+    let mut popular = make_memory(&format!("hybrid-popular-{uid}"), "stale popular", &uid);
+    popular.embedding = Some(dim_vec(0, 0.8));
+
+    store.insert(&relevant).await.unwrap();
+    store.insert(&popular).await.unwrap();
+
+    sqlx::query("INSERT INTO mem_memories_stats (memory_id, access_count) VALUES (?, 40)")
+        .bind(&popular.memory_id)
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+    let (results, _) = store
+        .search_hybrid_from_scored("mem_memories", &uid, &dim_vec(0, 1.0), "zzzzzz", 2, 0.0)
+        .await
+        .expect("hybrid search");
+
+    assert_eq!(
+        results.first().map(|m| m.memory_id.as_str()),
+        Some(relevant.memory_id.as_str()),
+        "access_count should not outrank the stronger semantic match"
+    );
+}
+
 // ── Field round-trip: every column written and read back ─────────────────────
 
 #[tokio::test]
