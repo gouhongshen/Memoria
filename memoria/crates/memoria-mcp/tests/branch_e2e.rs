@@ -1,3 +1,5 @@
+use memoria_core::interfaces::EmbeddingProvider;
+use memoria_embedding::MockEmbedder;
 /// Branch end-to-end tests — from the user's perspective.
 /// Covers: create, checkout, store, merge, diff, delete, limits, from_snapshot,
 ///         from_timestamp, multi-user isolation, delete-main protection.
@@ -7,11 +9,12 @@
 ///
 /// Run: DATABASE_URL=mysql://root:111@localhost:6001/memoria \
 ///      cargo test -p memoria-mcp --test branch_e2e -- --test-threads=1 --nocapture
+mod support;
+
 use memoria_git::GitForDataService;
 use memoria_service::MemoryService;
-use memoria_storage::SqlMemoryStore;
 use serde_json::{json, Value};
-use sqlx::mysql::MySqlPool;
+use sqlx::{mysql::MySqlPool, Row};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -22,10 +25,6 @@ fn test_dim() -> usize {
         .unwrap_or(1024)
 }
 
-fn db_url() -> String {
-    std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "mysql://root:111@localhost:6001/memoria".to_string())
-}
 fn uid() -> String {
     format!("br_{}", &Uuid::new_v4().simple().to_string()[..8])
 }
@@ -33,16 +32,30 @@ fn bname(suffix: &str) -> String {
     format!("b{}_{suffix}", &Uuid::new_v4().simple().to_string()[..6])
 }
 
-async fn setup() -> (Arc<MemoryService>, Arc<GitForDataService>, String) {
-    let pool = MySqlPool::connect(&db_url()).await.expect("pool");
-    let db_name = db_url().rsplit('/').next().unwrap_or("memoria").to_string();
-    let store = SqlMemoryStore::connect(&db_url(), test_dim(), uuid::Uuid::new_v4().to_string())
-        .await
-        .expect("store");
-    store.migrate().await.expect("migrate");
-    let git = Arc::new(GitForDataService::new(pool, &db_name));
-    let svc = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), None, None).await);
-    (svc, git, uid())
+async fn setup() -> (
+    Arc<MemoryService>,
+    Arc<GitForDataService>,
+    String,
+    support::multi_db::McpTestContext,
+) {
+    let ctx = support::multi_db::setup_mcp_context("branch_e2e", test_dim(), None, None).await;
+    (ctx.service(), ctx.git(), uid(), ctx)
+}
+
+async fn setup_with_mock_embedder() -> (
+    Arc<MemoryService>,
+    Arc<GitForDataService>,
+    MySqlPool,
+    String,
+    support::multi_db::McpTestContext,
+) {
+    let embedder: Option<Arc<dyn EmbeddingProvider>> =
+        Some(Arc::new(MockEmbedder::new(test_dim())));
+    let ctx =
+        support::multi_db::setup_mcp_context("branch_e2e_mock", test_dim(), embedder, None).await;
+    let uid = uid();
+    let pool = ctx.user_db_pool(&uid).await;
+    (ctx.service(), ctx.git(), pool, uid, ctx)
 }
 
 async fn gc(
@@ -69,7 +82,7 @@ fn text(v: &Value) -> &str {
 
 #[tokio::test]
 async fn test_basic_branch_workflow() {
-    let (svc, git, uid) = setup().await;
+    let (svc, git, uid, _ctx) = setup().await;
     let branch = bname("basic");
 
     store_mem("main memory", &svc, &uid).await;
@@ -110,7 +123,7 @@ async fn test_basic_branch_workflow() {
 
 #[tokio::test]
 async fn test_merge_accept_alias() {
-    let (svc, git, uid) = setup().await;
+    let (svc, git, uid, _ctx) = setup().await;
     let branch = bname("accept");
 
     store_mem("main memory", &svc, &uid).await;
@@ -145,11 +158,97 @@ async fn test_merge_accept_alias() {
     .await;
 }
 
+#[tokio::test]
+async fn test_merge_replace_updates_conflicting_memory() {
+    let (svc, git, pool, uid, ctx) = setup_with_mock_embedder().await;
+    let branch = bname("replace");
+    let replacement = "branch replacement memory";
+
+    store_mem("shared conflict memory", &svc, &uid).await;
+    let original = svc
+        .list_active(&uid, 10)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|memory| memory.content == "shared conflict memory")
+        .expect("original memory");
+
+    gc("memory_branch", json!({"name": branch}), &git, &svc, &uid).await;
+    let branch_table = ctx
+        .user_store(&uid)
+        .await
+        .list_branches(&uid)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|(name, _)| name == &branch)
+        .map(|(_, table)| table)
+        .expect("branch table");
+
+    let branch_memory_id = Uuid::new_v4().simple().to_string();
+    let insert_sql = format!(
+        "INSERT INTO {branch_table} \
+            (memory_id, user_id, memory_type, content, embedding, session_id, \
+             source_event_ids, extra_metadata, is_active, superseded_by, \
+             trust_tier, initial_confidence, observed_at, created_at, updated_at) \
+         SELECT ?, user_id, memory_type, ?, embedding, session_id, \
+                source_event_ids, extra_metadata, is_active, superseded_by, \
+                trust_tier, initial_confidence, observed_at, created_at, updated_at \
+         FROM mem_memories WHERE memory_id = ?"
+    );
+    sqlx::query(&insert_sql)
+        .bind(&branch_memory_id)
+        .bind(replacement)
+        .bind(&original.memory_id)
+        .execute(&pool)
+        .await
+        .expect("insert conflicting branch row");
+
+    let r = gc(
+        "memory_merge",
+        json!({"source": branch, "strategy": "replace"}),
+        &git,
+        &svc,
+        &uid,
+    )
+    .await;
+    assert!(
+        text(&r).contains("1 replaced"),
+        "expected one replacement, got: {}",
+        text(&r)
+    );
+
+    let active = svc.list_active(&uid, 10).await.unwrap();
+    assert!(
+        active.iter().any(|memory| memory.content == replacement),
+        "replacement content should be visible in main"
+    );
+    let row = sqlx::query("SELECT content FROM mem_memories WHERE memory_id = ?")
+        .bind(&original.memory_id)
+        .fetch_one(&pool)
+        .await
+        .expect("main row after replace");
+    assert_eq!(
+        row.try_get::<String, _>("content").unwrap(),
+        replacement,
+        "main row should be updated without NULL content"
+    );
+
+    gc(
+        "memory_branch_delete",
+        json!({"name": branch}),
+        &git,
+        &svc,
+        &uid,
+    )
+    .await;
+}
+
 // ── 2. memory_diff shows new/modified before merge ────────────────────────────
 
 #[tokio::test]
 async fn test_diff_before_merge() {
-    let (svc, git, uid) = setup().await;
+    let (svc, git, uid, _ctx) = setup().await;
     let branch = bname("diff");
 
     store_mem("shared memory", &svc, &uid).await;
@@ -182,7 +281,7 @@ async fn test_diff_before_merge() {
 
 #[tokio::test]
 async fn test_diff_no_changes() {
-    let (svc, git, uid) = setup().await;
+    let (svc, git, uid, _ctx) = setup().await;
     let branch = bname("nochange");
 
     store_mem("existing memory", &svc, &uid).await;
@@ -207,7 +306,7 @@ async fn test_diff_no_changes() {
 
 #[tokio::test]
 async fn test_cannot_delete_main() {
-    let (svc, git, uid) = setup().await;
+    let (svc, git, uid, _ctx) = setup().await;
     let r = gc(
         "memory_branch_delete",
         json!({"name": "main"}),
@@ -224,7 +323,7 @@ async fn test_cannot_delete_main() {
 
 #[tokio::test]
 async fn test_delete_nonexistent_branch() {
-    let (svc, git, uid) = setup().await;
+    let (svc, git, uid, _ctx) = setup().await;
     let r = gc(
         "memory_branch_delete",
         json!({"name": "no_such_branch_xyz"}),
@@ -241,7 +340,7 @@ async fn test_delete_nonexistent_branch() {
 
 #[tokio::test]
 async fn test_checkout_nonexistent_branch() {
-    let (svc, git, uid) = setup().await;
+    let (svc, git, uid, _ctx) = setup().await;
     let result = memoria_mcp::git_tools::call(
         "memory_checkout",
         json!({"name": "ghost_branch"}),
@@ -256,7 +355,7 @@ async fn test_checkout_nonexistent_branch() {
 
 #[tokio::test]
 async fn test_merge_unknown_strategy_rejected() {
-    let (svc, git, uid) = setup().await;
+    let (svc, git, uid, _ctx) = setup().await;
     let branch = bname("badmerge");
 
     store_mem("main memory", &svc, &uid).await;
@@ -287,7 +386,7 @@ async fn test_merge_unknown_strategy_rejected() {
 
 #[tokio::test]
 async fn test_duplicate_branch_name_rejected() {
-    let (svc, git, uid) = setup().await;
+    let (svc, git, uid, _ctx) = setup().await;
     let branch = bname("dup");
 
     gc("memory_branch", json!({"name": branch}), &git, &svc, &uid).await;
@@ -319,7 +418,7 @@ async fn test_duplicate_branch_name_rejected() {
 
 #[tokio::test]
 async fn test_branch_from_snapshot_and_timestamp_exclusive() {
-    let (svc, git, uid) = setup().await;
+    let (svc, git, uid, _ctx) = setup().await;
     let r = gc(
         "memory_branch",
         json!({"name": "x", "from_snapshot": "snap1", "from_timestamp": "2026-01-01 00:00:00"}),
@@ -336,7 +435,7 @@ async fn test_branch_from_snapshot_and_timestamp_exclusive() {
 
 #[tokio::test]
 async fn test_branch_from_timestamp_future_rejected() {
-    let (svc, git, uid) = setup().await;
+    let (svc, git, uid, _ctx) = setup().await;
     let r = gc(
         "memory_branch",
         json!({"name": bname("fut"), "from_timestamp": "2099-01-01 00:00:00"}),
@@ -353,7 +452,7 @@ async fn test_branch_from_timestamp_future_rejected() {
 
 #[tokio::test]
 async fn test_branch_from_timestamp_too_old_rejected() {
-    let (svc, git, uid) = setup().await;
+    let (svc, git, uid, _ctx) = setup().await;
     let r = gc(
         "memory_branch",
         json!({"name": bname("old"), "from_timestamp": "2020-01-01 00:00:00"}),
@@ -370,7 +469,7 @@ async fn test_branch_from_timestamp_too_old_rejected() {
 
 #[tokio::test]
 async fn test_branch_from_timestamp_invalid_format() {
-    let (svc, git, uid) = setup().await;
+    let (svc, git, uid, _ctx) = setup().await;
     let result = memoria_mcp::git_tools::call(
         "memory_branch",
         json!({"name": bname("fmt"), "from_timestamp": "not-a-date"}),
@@ -387,16 +486,16 @@ async fn test_branch_from_timestamp_invalid_format() {
 
 #[tokio::test]
 async fn test_active_branch_resets_on_delete() {
-    let (svc, git, uid) = setup().await;
+    let (svc, git, uid, ctx) = setup().await;
     let branch = bname("reset");
 
     gc("memory_branch", json!({"name": branch}), &git, &svc, &uid).await;
     gc("memory_checkout", json!({"name": branch}), &git, &svc, &uid).await;
 
     // Verify we're on branch
-    let sql = svc.sql_store.as_ref().unwrap();
+    let sql = ctx.user_store(&uid).await;
     let active = sql.active_table(&uid).await.unwrap();
-    assert_ne!(active, "mem_memories", "should be on branch table");
+    assert_ne!(active, sql.t("mem_memories"), "should be on branch table");
 
     // Delete branch while checked out
     gc(
@@ -408,10 +507,17 @@ async fn test_active_branch_resets_on_delete() {
     )
     .await;
 
+    let active_branch = sql.active_branch_name(&uid).await.unwrap();
+    assert_eq!(
+        active_branch, "main",
+        "stored active branch should reset to main after delete"
+    );
+
     // Should auto-reset to main
     let active = sql.active_table(&uid).await.unwrap();
     assert_eq!(
-        active, "mem_memories",
+        active,
+        sql.t("mem_memories"),
         "should reset to main after branch delete"
     );
     println!("✅ active branch reset to main after delete");
@@ -421,7 +527,7 @@ async fn test_active_branch_resets_on_delete() {
 
 #[tokio::test]
 async fn test_multiuser_branch_isolation() {
-    let (svc, git, _) = setup().await;
+    let (svc, git, _, _ctx) = setup().await;
     let uid_a = uid();
     let uid_b = uid();
     let branch_a = bname("ua");
@@ -522,7 +628,7 @@ async fn test_multiuser_branch_isolation() {
 
 #[tokio::test]
 async fn test_branches_list_shows_active_marker() {
-    let (svc, git, uid) = setup().await;
+    let (svc, git, uid, _ctx) = setup().await;
     let b1 = bname("list1");
     let b2 = bname("list2");
 
@@ -566,7 +672,7 @@ async fn test_branches_list_shows_active_marker() {
 
 #[tokio::test]
 async fn test_merge_idempotent() {
-    let (svc, git, uid) = setup().await;
+    let (svc, git, uid, _ctx) = setup().await;
     let branch = bname("idem");
 
     gc("memory_branch", json!({"name": branch}), &git, &svc, &uid).await;
@@ -599,7 +705,7 @@ async fn test_merge_idempotent() {
 
 #[tokio::test]
 async fn test_merge_nonexistent_branch_errors() {
-    let (svc, git, uid) = setup().await;
+    let (svc, git, uid, _ctx) = setup().await;
     let result = memoria_mcp::git_tools::call(
         "memory_merge",
         json!({"source": "ghost_branch_xyz"}),
@@ -616,7 +722,7 @@ async fn test_merge_nonexistent_branch_errors() {
 
 #[tokio::test]
 async fn test_diff_nonexistent_branch_errors() {
-    let (svc, git, uid) = setup().await;
+    let (svc, git, uid, _ctx) = setup().await;
     let result = memoria_mcp::git_tools::call(
         "memory_diff",
         json!({"source": "ghost_xyz"}),
@@ -633,7 +739,7 @@ async fn test_diff_nonexistent_branch_errors() {
 
 #[tokio::test]
 async fn test_branch_name_sanitization() {
-    let (svc, git, uid) = setup().await;
+    let (svc, git, uid, _ctx) = setup().await;
     // Name with spaces/dashes — should be sanitized and created successfully
     let r = gc(
         "memory_branch",
@@ -660,7 +766,7 @@ async fn test_branch_name_sanitization() {
 
 #[tokio::test]
 async fn test_diff_fields_complete() {
-    let (svc, git, uid) = setup().await;
+    let (svc, git, uid, ctx) = setup().await;
     let branch = bname("fields");
 
     store_mem("existing on main", &svc, &uid).await;
@@ -680,15 +786,21 @@ async fn test_diff_fields_complete() {
     gc("memory_checkout", json!({"name": "main"}), &git, &svc, &uid).await;
 
     // Use GitForDataService directly to check DiffRow fields
-    let sql = svc.sql_store.as_ref().unwrap();
+    let sql = ctx.user_store(&uid).await;
     let branches = sql.list_branches(&uid).await.unwrap();
     let table = branches
         .iter()
         .find(|(n, _)| n == &branch)
         .map(|(_, t)| t.clone())
         .unwrap();
+    let user_git = GitForDataService::new(
+        sql.pool().clone(),
+        sql.database_name()
+            .expect("user db name")
+            .to_string(),
+    );
 
-    let rows = git
+    let rows = user_git
         .diff_branch_rows(&table, "mem_memories", &uid, 50)
         .await
         .unwrap();
@@ -706,7 +818,7 @@ async fn test_diff_fields_complete() {
     );
 
     // Native count >= 1 (may include other users' changes)
-    let count = git
+    let count = user_git
         .diff_branch_count(&table, "mem_memories", &uid)
         .await
         .unwrap();
@@ -727,7 +839,7 @@ async fn test_diff_fields_complete() {
 
 #[tokio::test]
 async fn test_diff_limit_truncation() {
-    let (svc, git, uid) = setup().await;
+    let (svc, git, uid, _ctx) = setup().await;
     let branch = bname("trunc");
 
     gc("memory_branch", json!({"name": branch}), &git, &svc, &uid).await;
@@ -770,7 +882,7 @@ async fn test_diff_limit_truncation() {
 
 #[tokio::test]
 async fn test_diff_native_count_vs_join_rows() {
-    let (svc, git, uid) = setup().await;
+    let (svc, git, uid, ctx) = setup().await;
     let branch = bname("countvsrows");
 
     // Store 2 memories on main
@@ -786,23 +898,29 @@ async fn test_diff_native_count_vs_join_rows() {
 
     gc("memory_checkout", json!({"name": "main"}), &git, &svc, &uid).await;
 
-    let sql = svc.sql_store.as_ref().unwrap();
+    let sql = ctx.user_store(&uid).await;
     let branches = sql.list_branches(&uid).await.unwrap();
     let table = branches
         .iter()
         .find(|(n, _)| n == &branch)
         .map(|(_, t)| t.clone())
         .unwrap();
+    let user_git = GitForDataService::new(
+        sql.pool().clone(),
+        sql.database_name()
+            .expect("user db name")
+            .to_string(),
+    );
 
     // Native count: >= 1 (account-level, may include other users)
-    let count = git
+    let count = user_git
         .diff_branch_count(&table, "mem_memories", &uid)
         .await
         .unwrap();
     assert!(count >= 1, "native LCA diff count should be at least 1");
 
     // Find our specific row
-    let rows = git
+    let rows = user_git
         .diff_branch_rows(&table, "mem_memories", &uid, 50)
         .await
         .unwrap();
@@ -829,7 +947,7 @@ async fn test_diff_native_count_vs_join_rows() {
 
 #[tokio::test]
 async fn test_correct_on_branch_isolated_from_main() {
-    let (svc, git, uid) = setup().await;
+    let (svc, git, uid, _ctx) = setup().await;
     let branch = bname("correctiso");
 
     // Store on main
@@ -898,7 +1016,7 @@ async fn test_correct_on_branch_isolated_from_main() {
 
 #[tokio::test]
 async fn test_purge_on_branch_isolated_from_main() {
-    let (svc, git, uid) = setup().await;
+    let (svc, git, uid, _ctx) = setup().await;
     let branch = bname("purgeiso");
 
     // Store on main
@@ -947,7 +1065,7 @@ async fn test_purge_on_branch_isolated_from_main() {
 
 #[tokio::test]
 async fn test_purge_by_topic_on_branch_isolated_from_main() {
-    let (svc, git, uid) = setup().await;
+    let (svc, git, uid, _ctx) = setup().await;
     let branch = bname("topiciso");
 
     // Store on main
@@ -1001,7 +1119,7 @@ async fn test_purge_by_topic_on_branch_isolated_from_main() {
 
 #[tokio::test]
 async fn test_purge_batch_on_branch_isolated_from_main() {
-    let (svc, git, uid) = setup().await;
+    let (svc, git, uid, _ctx) = setup().await;
     let branch = bname("batchiso");
 
     // Store two memories on main
@@ -1054,7 +1172,7 @@ async fn test_purge_batch_on_branch_isolated_from_main() {
 
 #[tokio::test]
 async fn test_correct_blocks_sensitive_content() {
-    let (svc, _git, uid) = setup().await;
+    let (svc, _git, uid, _ctx) = setup().await;
 
     // Store a normal memory
     store_mem("database config info", &svc, &uid).await;
@@ -1092,7 +1210,7 @@ async fn test_correct_blocks_sensitive_content() {
 
 #[tokio::test]
 async fn test_correct_triggers_entity_extraction() {
-    let (svc, _git, uid) = setup().await;
+    let (svc, _git, uid, _ctx) = setup().await;
 
     // Store a memory with an entity
     store_mem("Project uses PostgreSQL database", &svc, &uid).await;
@@ -1150,7 +1268,7 @@ async fn test_correct_triggers_entity_extraction() {
 
 #[tokio::test]
 async fn test_get_for_user_finds_branch_only_memory() {
-    let (svc, git, uid) = setup().await;
+    let (svc, git, uid, _ctx) = setup().await;
     let branch = bname("getuser");
 
     // Create branch, checkout, store a branch-only memory
@@ -1175,10 +1293,10 @@ async fn test_get_for_user_finds_branch_only_memory() {
     assert_eq!(found.unwrap().content, "branch-only secret");
 
     // plain get() should NOT find it (hardcoded to mem_memories)
-    let not_found = svc.get(&branch_mid).await.unwrap();
+    let plain_get = svc.get(&branch_mid).await;
     assert!(
-        not_found.is_none(),
-        "plain get() should not find branch-only memory"
+        plain_get.is_err() || plain_get.unwrap().is_none(),
+        "plain get() should not resolve branch-only memory in multi-db"
     );
 
     println!("✅ get_for_user finds branch-only memory, get() does not");
@@ -1198,7 +1316,7 @@ async fn test_get_for_user_finds_branch_only_memory() {
 
 #[tokio::test]
 async fn test_micro_batch_entity_extraction() {
-    let (svc, _git, uid) = setup().await;
+    let (svc, _git, uid, _ctx) = setup().await;
 
     // Burst-write 10 memories with distinct entities — should trigger micro-batching
     let contents = [
@@ -1247,7 +1365,7 @@ async fn test_micro_batch_entity_extraction() {
 
 #[tokio::test]
 async fn test_batch_entity_deduplication_across_memories() {
-    let (svc, _git, uid) = setup().await;
+    let (svc, _git, uid, ctx) = setup().await;
 
     // Multiple memories mention the same entity — should deduplicate in batch
     store_mem("Rust is great for systems programming", &svc, &uid).await;
@@ -1257,7 +1375,7 @@ async fn test_batch_entity_deduplication_across_memories() {
     tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
 
     // Check that "rust" entity exists only once
-    let sql = svc.sql_store.as_ref().expect("sql_store");
+    let sql = ctx.user_store(&uid).await;
     let graph = sql.graph_store();
     let entities = graph.get_user_entities(&uid).await.unwrap();
 

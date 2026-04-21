@@ -11,16 +11,44 @@ use memoria_service::{
 };
 use serde::{Deserialize, Serialize};
 use sqlx::{MySqlPool, Row};
+use std::sync::Arc;
 
 use crate::{auth::AuthUser, routes::memory::api_err, state::AppState};
 
-fn get_pool(state: &AppState) -> Result<&MySqlPool, (StatusCode, String)> {
+fn get_shared_pool(state: &AppState) -> Result<&MySqlPool, (StatusCode, String)> {
     state
+        .auth_pool
+        .as_ref()
+        .or_else(|| state.service.sql_store.as_ref().map(|s| s.pool()))
+        .ok_or((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "No shared SQL pool".into(),
+        ))
+}
+
+async fn get_user_store(
+    state: &AppState,
+    user_id: &str,
+) -> Result<Arc<memoria_storage::SqlMemoryStore>, (StatusCode, String)> {
+    state.service.user_sql_store(user_id).await.map_err(api_err)
+}
+
+async fn list_known_users(state: &AppState) -> Result<Vec<String>, (StatusCode, String)> {
+    let sql = state
         .service
         .sql_store
         .as_ref()
-        .map(|s| s.pool())
-        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "No SQL store".into()))
+        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "No SQL store".into()))?;
+    if let Some(router) = sql.db_router() {
+        return router.list_active_users().await.map_err(api_err);
+    }
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT DISTINCT user_id FROM mem_memories WHERE is_active > 0 ORDER BY user_id",
+    )
+    .fetch_all(sql.pool())
+    .await
+    .map_err(db_err)?;
+    Ok(rows.into_iter().map(|row| row.0).collect())
 }
 
 fn db_err(e: impl std::fmt::Display) -> (StatusCode, String) {
@@ -73,26 +101,29 @@ pub async fn system_stats(
     State(state): State<AppState>,
 ) -> Result<Json<SystemStats>, (StatusCode, String)> {
     auth.require_master()?;
-    let pool = get_pool(&state)?;
-
-    let (total_users,): (i64,) =
-        sqlx::query_as("SELECT COUNT(DISTINCT user_id) FROM mem_memories WHERE is_active > 0")
-            .fetch_one(pool)
+    let user_ids = list_known_users(&state).await?;
+    let mut total_memories = 0i64;
+    let mut total_snapshots = 0i64;
+    for user_id in &user_ids {
+        let user_store = get_user_store(&state, user_id).await?;
+        let memories_table = user_store.t("mem_memories");
+        total_memories += sqlx::query_scalar::<_, i64>(&format!(
+            "SELECT COUNT(*) FROM {memories_table} WHERE is_active > 0"
+        ))
+        .fetch_one(user_store.pool())
+        .await
+        .map_err(db_err)?;
+        total_snapshots += user_store
+            .list_snapshot_registrations(user_id)
             .await
-            .map_err(db_err)?;
-
-    let (total_memories,): (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM mem_memories WHERE is_active > 0")
-            .fetch_one(pool)
-            .await
-            .map_err(db_err)?;
-
-    let snapshots = state.git.list_snapshots().await.map_err(db_err)?;
+            .map_err(api_err)?
+            .len() as i64;
+    }
 
     Ok(Json(SystemStats {
-        total_users,
+        total_users: user_ids.len() as i64,
         total_memories,
-        total_snapshots: snapshots.len() as i64,
+        total_snapshots,
     }))
 }
 
@@ -103,29 +134,23 @@ pub async fn list_users(
     Query(params): Query<CursorParams>,
 ) -> Result<Json<UserListResponse>, (StatusCode, String)> {
     auth.require_master()?;
-    let pool = get_pool(&state)?;
     let limit = params.limit.unwrap_or(100);
+    let mut users = list_known_users(&state).await?;
+    if let Some(ref cursor) = params.cursor {
+        users.retain(|user_id| user_id > cursor);
+    }
+    let users: Vec<String> = users.into_iter().take(limit as usize).collect();
 
-    let rows: Vec<(String,)> = if let Some(ref cursor) = params.cursor {
-        sqlx::query_as(
-            "SELECT DISTINCT user_id FROM mem_memories WHERE is_active > 0 AND user_id > ? ORDER BY user_id LIMIT ?"
-        ).bind(cursor).bind(limit).fetch_all(pool).await
-    } else {
-        sqlx::query_as(
-            "SELECT DISTINCT user_id FROM mem_memories WHERE is_active > 0 ORDER BY user_id LIMIT ?"
-        ).bind(limit).fetch_all(pool).await
-    }.map_err(db_err)?;
-
-    let next_cursor = if rows.len() as i64 == limit {
-        rows.last().map(|r| r.0.clone())
+    let next_cursor = if users.len() as i64 == limit {
+        users.last().cloned()
     } else {
         None
     };
 
     Ok(Json(UserListResponse {
-        users: rows
+        users: users
             .into_iter()
-            .map(|r| UserEntry { user_id: r.0 })
+            .map(|user_id| UserEntry { user_id })
             .collect(),
         next_cursor,
     }))
@@ -138,21 +163,25 @@ pub async fn user_stats(
     Path(user_id): Path<String>,
 ) -> Result<Json<UserStats>, (StatusCode, String)> {
     auth.require_master()?;
-    let pool = get_pool(&state)?;
-
-    let (memory_count,): (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM mem_memories WHERE user_id = ? AND is_active > 0")
-            .bind(&user_id)
-            .fetch_one(pool)
-            .await
-            .map_err(db_err)?;
-
-    let snapshots = state.git.list_snapshots().await.map_err(db_err)?;
+    let user_store = get_user_store(&state, &user_id).await?;
+    let memories_table = user_store.t("mem_memories");
+    let memory_count = sqlx::query_scalar::<_, i64>(&format!(
+        "SELECT COUNT(*) FROM {memories_table} WHERE user_id = ? AND is_active > 0"
+    ))
+    .bind(&user_id)
+    .fetch_one(user_store.pool())
+    .await
+    .map_err(db_err)?;
+    let snapshot_count = user_store
+        .list_snapshot_registrations(&user_id)
+        .await
+        .map_err(api_err)?
+        .len() as i64;
 
     Ok(Json(UserStats {
         user_id,
         memory_count,
-        snapshot_count: snapshots.len() as i64,
+        snapshot_count,
     }))
 }
 
@@ -163,12 +192,25 @@ pub async fn delete_user(
     Path(user_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     auth.require_master()?;
-    let pool = get_pool(&state)?;
-    sqlx::query("UPDATE mem_memories SET is_active = 0 WHERE user_id = ?")
-        .bind(&user_id)
-        .execute(pool)
+    let user_store = get_user_store(&state, &user_id).await?;
+    let memories_table = user_store.t("mem_memories");
+    sqlx::query(&format!(
+        "UPDATE {memories_table} SET is_active = 0 WHERE user_id = ?"
+    ))
+    .bind(&user_id)
+    .execute(user_store.pool())
+    .await
+    .map_err(db_err)?;
+    if let Err(e) = state
+        .mark_metrics_dirty(&user_id, crate::metrics_summary::DirtyMask::FULL)
         .await
-        .map_err(db_err)?;
+    {
+        tracing::warn!(
+            user_id = user_id,
+            error = %e,
+            "failed to mark metrics summary dirty after admin delete_user"
+        );
+    }
     Ok(Json(
         serde_json::json!({"status": "ok", "user_id": user_id}),
     ))
@@ -181,12 +223,7 @@ pub async fn reset_access_counts(
     Path(user_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     auth.require_master()?;
-    let sql = state.service.sql_store.as_ref().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "SQL store required".to_string(),
-        )
-    })?;
+    let sql = get_user_store(&state, &user_id).await?;
     let reset = sql.reset_access_counts(&user_id).await.map_err(api_err)?;
     Ok(Json(
         serde_json::json!({"user_id": user_id, "reset": reset}),
@@ -203,11 +240,7 @@ pub async fn trigger_governance(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     auth.require_master()?;
     let op = params.op.as_deref().unwrap_or("governance");
-    let sql = state
-        .service
-        .sql_store
-        .as_ref()
-        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "SQL store required".into()))?;
+    let sql = get_user_store(&state, &user_id).await?;
 
     match op {
         "governance" => {
@@ -262,7 +295,7 @@ pub async fn trigger_governance(
             })))
         }
         "extract_entities" => {
-            let r = memoria_storage::graph::backfill::backfill_graph(sql, &user_id)
+            let r = memoria_storage::graph::backfill::backfill_graph(&sql, &user_id)
                 .await
                 .map_err(db_err)?;
             Ok(Json(serde_json::json!({
@@ -293,11 +326,7 @@ pub async fn health_hygiene(
     AuthUser { user_id, .. }: AuthUser,
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let sql = state
-        .service
-        .sql_store
-        .as_ref()
-        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "SQL store required".into()))?;
+    let sql = get_user_store(&state, &user_id).await?;
     let result = sql.health_hygiene(&user_id).await.map_err(db_err)?;
     Ok(Json(result))
 }
@@ -313,6 +342,46 @@ pub async fn health_hygiene_global(
         .sql_store
         .as_ref()
         .ok_or((StatusCode::SERVICE_UNAVAILABLE, "SQL store required".into()))?;
+    if let Some(router) = sql.db_router() {
+        let user_ids = router.list_active_users().await.map_err(api_err)?;
+        let mut inactive = 0i64;
+        let mut stale_working = 0i64;
+        let mut orphan_mel = 0i64;
+        let mut orphan_el = 0i64;
+        let mut orphan_graph_nodes = 0i64;
+        let mut orphan_stats = 0i64;
+
+        for user_id in user_ids {
+            let user_store = state.service.user_sql_store(&user_id).await.map_err(api_err)?;
+            let hygiene = user_store.health_hygiene(&user_id).await.map_err(db_err)?;
+            inactive += hygiene["inactive_memories"].as_i64().unwrap_or(0);
+            stale_working += hygiene["stale_working_memories"].as_i64().unwrap_or(0);
+            orphan_mel += hygiene["orphan_memory_entity_links"].as_i64().unwrap_or(0);
+            orphan_el += hygiene["orphan_entity_links"].as_i64().unwrap_or(0);
+            orphan_graph_nodes += hygiene["orphan_graph_nodes"].as_i64().unwrap_or(0);
+
+            let memory_stats_table = user_store.t("mem_memories_stats");
+            let memories_table = user_store.t("mem_memories");
+            let (user_orphan_stats,): (i64,) = sqlx::query_as(&format!(
+                "SELECT COUNT(*) FROM {memory_stats_table} s \
+                 LEFT JOIN {memories_table} m ON s.memory_id = m.memory_id \
+                 WHERE m.memory_id IS NULL"
+            ))
+            .fetch_one(user_store.pool())
+            .await
+            .map_err(db_err)?;
+            orphan_stats += user_orphan_stats;
+        }
+
+        return Ok(Json(serde_json::json!({
+            "inactive_memories": inactive,
+            "stale_working_memories": stale_working,
+            "orphan_memory_entity_links": orphan_mel,
+            "orphan_entity_links": orphan_el,
+            "orphan_graph_nodes": orphan_graph_nodes,
+            "orphan_stats": orphan_stats,
+        })));
+    }
     let result = sql.health_hygiene_global().await.map_err(db_err)?;
     Ok(Json(result))
 }
@@ -322,11 +391,7 @@ pub async fn health_analyze(
     AuthUser { user_id, .. }: AuthUser,
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let sql = state
-        .service
-        .sql_store
-        .as_ref()
-        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "SQL store required".into()))?;
+    let sql = get_user_store(&state, &user_id).await?;
     let result = sql.health_analyze(&user_id).await.map_err(db_err)?;
     Ok(Json(result))
 }
@@ -336,11 +401,7 @@ pub async fn health_storage(
     AuthUser { user_id, .. }: AuthUser,
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let sql = state
-        .service
-        .sql_store
-        .as_ref()
-        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "SQL store required".into()))?;
+    let sql = get_user_store(&state, &user_id).await?;
     let result = sql.health_storage_stats(&user_id).await.map_err(db_err)?;
     Ok(Json(result))
 }
@@ -350,11 +411,7 @@ pub async fn health_capacity(
     AuthUser { user_id, .. }: AuthUser,
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let sql = state
-        .service
-        .sql_store
-        .as_ref()
-        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "SQL store required".into()))?;
+    let sql = get_user_store(&state, &user_id).await?;
     let result = sql.health_capacity(&user_id).await.map_err(db_err)?;
     Ok(Json(result))
 }
@@ -386,7 +443,7 @@ pub async fn list_user_keys(
     Path(user_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     auth.require_master()?;
-    let pool = get_pool(&state)?;
+    let pool = get_shared_pool(&state)?;
     let rows = sqlx::query(
         "SELECT key_id, name, key_prefix, created_at, expires_at, last_used_at \
          FROM mem_api_keys WHERE user_id = ? AND is_active = 1 ORDER BY created_at DESC",
@@ -417,7 +474,7 @@ pub async fn revoke_all_user_keys(
     Path(user_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     auth.require_master()?;
-    let pool = get_pool(&state)?;
+    let pool = get_shared_pool(&state)?;
     let result =
         sqlx::query("UPDATE mem_api_keys SET is_active = 0 WHERE user_id = ? AND is_active = 1")
             .bind(&user_id)
@@ -437,7 +494,7 @@ pub async fn set_user_params(
     Json(params): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     auth.require_master()?;
-    let pool = get_pool(&state)?;
+    let pool = get_shared_pool(&state)?;
     let pj = serde_json::to_string(&params).map_err(db_err)?;
     sqlx::query(
         "UPDATE mem_user_memory_config SET params_json = ?, updated_at = NOW() WHERE user_id = ?",
@@ -513,7 +570,8 @@ pub async fn user_call_stats(
     Query(params): Query<CallStatsQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     auth.require_master()?;
-    let pool = get_pool(&state)?;
+    let store = get_user_store(&state, &user_id).await?;
+    let call_log = store.t("mem_api_call_log");
 
     let days = params.days.unwrap_or(7).clamp(1, 90) as i64;
 
@@ -521,17 +579,17 @@ pub async fn user_call_stats(
     // Error counting unifies HTTP errors (/v1/*) and JSON-RPC errors (/mcp/*):
     //   - /v1/* REST calls: HTTP status_code >= 400 signals an error
     //   - /mcp/* JSON-RPC calls: HTTP is always 200; rpc_success = 0 signals an error
-    let row = sqlx::query(
+    let row = sqlx::query(&format!(
         "SELECT \
             CAST(COUNT(*) AS SIGNED) AS total, \
             CAST(COALESCE(AVG(latency_ms), 0) AS DOUBLE) AS avg_ms, \
             CAST(SUM(CASE WHEN status_code >= 400 OR rpc_success = 0 THEN 1 ELSE 0 END) AS SIGNED) AS errors \
-         FROM mem_api_call_log \
+         FROM {call_log} \
          WHERE user_id = ? AND called_at >= DATE_SUB(NOW(6), INTERVAL ? DAY)",
-    )
+    ))
     .bind(&user_id)
     .bind(days)
-    .fetch_one(pool)
+    .fetch_one(store.pool())
     .await
     .map_err(db_err)?;
 
@@ -542,7 +600,7 @@ pub async fn user_call_stats(
     // Per-(method, path) breakdown — used as "by_tool" in the Monitor dashboard.
     // Grouping by method disambiguates e.g. POST /v1/memories (store) vs
     // GET /v1/memories (list).
-    let by_path_rows = sqlx::query(
+    let by_path_rows = sqlx::query(&format!(
         "SELECT \
             method, \
             path, \
@@ -551,15 +609,15 @@ pub async fn user_call_stats(
             CAST(COALESCE(MAX(latency_ms), 0) AS SIGNED) AS max_ms, \
             CAST(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END) AS SIGNED) AS err_cnt, \
             CAST(SUM(CASE WHEN rpc_success = 0 THEN 1 ELSE 0 END) AS SIGNED) AS rpc_err_cnt \
-         FROM mem_api_call_log \
+         FROM {call_log} \
          WHERE user_id = ? AND called_at >= DATE_SUB(NOW(6), INTERVAL ? DAY) \
          GROUP BY method, path \
          ORDER BY cnt DESC \
          LIMIT 50",
-    )
+    ))
     .bind(&user_id)
     .bind(days)
-    .fetch_all(pool)
+    .fetch_all(store.pool())
     .await
     .map_err(db_err)?;
 
@@ -592,15 +650,15 @@ pub async fn user_call_stats(
 
     // Most recent 50 calls for the live "Recent Calls" feed.
     // Include rpc_success so /mcp errors (HTTP 200 but RPC failure) show as "err".
-    let recent_rows = sqlx::query(
+    let recent_rows = sqlx::query(&format!(
         "SELECT method, path, status_code, latency_ms, called_at, rpc_success \
-         FROM mem_api_call_log \
+         FROM {call_log} \
          WHERE user_id = ? \
          ORDER BY called_at DESC \
          LIMIT 50",
-    )
+    ))
     .bind(&user_id)
-    .fetch_all(pool)
+    .fetch_all(store.pool())
     .await
     .unwrap_or_default();
 
@@ -631,7 +689,7 @@ pub async fn user_call_stats(
 
     // ── All-time per-type aggregates (no days filter) ─────────────────────────
     // Used by the Usage panel's stats cards: total_writes, total_searches, etc.
-    let at_row = sqlx::query(
+    let at_row = sqlx::query(&format!(
         "SELECT \
             CAST(COUNT(*) AS SIGNED) AS total, \
             CAST(SUM(CASE WHEN (path = '/v1/memories' AND method = 'POST') \
@@ -646,11 +704,11 @@ pub async fn user_call_stats(
             CAST(COALESCE(AVG(CASE WHEN path IN ('/v1/memories/search','/v1/memories/retrieve', \
                                                   '/mcp/memory_retrieve','/mcp/memory_search') \
                               THEN latency_ms END), 0) AS DOUBLE) AS avg_retrieval_ms \
-         FROM mem_api_call_log \
+         FROM {call_log} \
          WHERE user_id = ?",
-    )
+    ))
     .bind(&user_id)
-    .fetch_one(pool)
+    .fetch_one(store.pool())
     .await
     .map_err(db_err)?;
 
@@ -663,7 +721,7 @@ pub async fn user_call_stats(
     // ── Per-day series within the requested window ─────────────────────────────
     // Used by the Usage panel's API Call Tracking chart.
     // day_idx = 0 → oldest calendar day,  day_idx = days-1 → today  (DB timezone).
-    let series_rows = sqlx::query(
+    let series_rows = sqlx::query(&format!(
         "SELECT \
             CAST(DATEDIFF(DATE(called_at), \
                           DATE(DATE_SUB(NOW(6), INTERVAL ? DAY))) AS SIGNED) AS day_idx, \
@@ -677,16 +735,16 @@ pub async fn user_call_stats(
                                         '/mcp/memory_retrieve','/mcp/memory_search') \
                          THEN 1 ELSE 0 END) AS SIGNED) AS retrieves, \
             CAST(COUNT(*) AS SIGNED) AS total \
-         FROM mem_api_call_log \
-         WHERE user_id = ? \
-           AND DATE(called_at) >= DATE(DATE_SUB(NOW(6), INTERVAL ? DAY)) \
-         GROUP BY DATE(called_at) \
-         ORDER BY DATE(called_at) ASC",
-    )
+          FROM {call_log} \
+          WHERE user_id = ? \
+            AND DATE(called_at) >= DATE(DATE_SUB(NOW(6), INTERVAL ? DAY)) \
+          GROUP BY DATE(called_at) \
+          ORDER BY DATE(called_at) ASC",
+    ))
     .bind(days - 1) // offset = days - 1 so day_idx 0 = oldest day
     .bind(&user_id)
     .bind(days - 1)
-    .fetch_all(pool)
+    .fetch_all(store.pool())
     .await
     .unwrap_or_default();
 

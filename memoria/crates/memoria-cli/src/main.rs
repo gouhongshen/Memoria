@@ -7,6 +7,7 @@
 //!   memoria status        — show configuration status
 //!   memoria rules         — write/update steering rules (auto-detect or --tool)
 //!   memoria benchmark     — run benchmark against a Memoria API server
+//!   memoria migrate       — run offline migration and cutover tooling
 
 mod benchmark;
 
@@ -80,6 +81,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Start REST API server
+    #[cfg(feature = "server-runtime")]
     Serve {
         #[arg(long, env = "DATABASE_URL")]
         db_url: Option<String>,
@@ -89,10 +91,12 @@ enum Commands {
         master_key: String,
     },
     /// Start MCP server (embedded or remote mode)
+    #[cfg(feature = "server-runtime")]
     Mcp {
-        /// AI tool that launched this MCP server (sent as X-Memoria-Tool header)
+        /// AI tool that launched this MCP server (sent as X-Memoria-Tool header).
+        /// Accepts any string (e.g. kiro, cursor, opencode, my-agent).
         #[arg(long, env = "MEMORIA_TOOL")]
-        tool: Option<ToolName>,
+        tool: Option<String>,
         /// Remote Memoria API URL (remote mode)
         #[arg(long, env = "MEMORIA_API_URL")]
         api_url: Option<String>,
@@ -202,6 +206,11 @@ enum Commands {
     Plugin {
         #[command(subcommand)]
         command: PluginCommands,
+    },
+    /// Run offline migration tooling
+    Migrate {
+        #[command(subcommand)]
+        command: MigrationCommands,
     },
 }
 
@@ -349,14 +358,169 @@ enum PluginCommands {
     },
 }
 
+#[derive(Subcommand)]
+enum MigrationCommands {
+    /// Migrate a legacy single-db deployment into shared DB + per-user DB layout
+    LegacyToMultiDb {
+        /// Legacy single-db DATABASE_URL (source)
+        #[arg(long, env = "DATABASE_URL")]
+        legacy_db_url: String,
+        /// Shared DB URL for the target multi-db deployment
+        #[arg(long, env = "MEMORIA_SHARED_DATABASE_URL")]
+        shared_db_url: String,
+        /// Embedding dimension used by the target schema
+        #[arg(long, env = "EMBEDDING_DIM", default_value_t = 1024)]
+        embedding_dim: usize,
+        /// Limit per-user migration to one or more users (for rehearsal/troubleshooting)
+        #[arg(long = "user")]
+        user_ids: Vec<String>,
+        /// Number of users to migrate in parallel (default: 1 = serial)
+        #[arg(long, default_value_t = 1)]
+        concurrency: usize,
+        /// Execute the migration; without this flag, the command performs a dry run only
+        #[arg(long)]
+        execute: bool,
+        /// Save the full migration report as JSON
+        #[arg(long)]
+        report_out: Option<String>,
+    },
+}
+
 // ── Serve (API server) ────────────────────────────────────────────────────────
 
+#[cfg(feature = "server-runtime")]
+fn configured_server_pool_size(env_name: &str, default: u32, upper: u32) -> u32 {
+    std::env::var(env_name)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
+        .clamp(1, upper)
+}
+
+#[cfg(feature = "server-runtime")]
+const LEGACY_MIGRATION_MAX_CONCURRENCY_ENV: &str = "MEMORIA_LEGACY_MIGRATION_MAX_CONCURRENCY";
+#[cfg(feature = "server-runtime")]
+const LEGACY_MIGRATION_DEFAULT_CONCURRENCY: usize = 6;
+
+#[cfg(feature = "server-runtime")]
+fn configured_legacy_migration_concurrency() -> usize {
+    std::env::var(LEGACY_MIGRATION_MAX_CONCURRENCY_ENV)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .or_else(|| {
+            std::env::var("MEMORIA_USER_SCHEMA_INIT_MAX_CONCURRENCY")
+                .ok()
+                .and_then(|s| s.parse().ok())
+        })
+        .unwrap_or(LEGACY_MIGRATION_DEFAULT_CONCURRENCY)
+        .clamp(1, 64)
+}
+
+#[cfg(feature = "server-runtime")]
+async fn connect_git_pool(database_url: &str, multi_db: bool) -> Result<sqlx::MySqlPool> {
+    use sqlx::mysql::MySqlPoolOptions;
+
+    let default_max = if multi_db { 8 } else { 10 };
+    let max_connections =
+        configured_server_pool_size("MEMORIA_GIT_POOL_MAX_CONNECTIONS", default_max, 64);
+    let pool = MySqlPoolOptions::new()
+        .max_connections(max_connections)
+        .max_lifetime(std::time::Duration::from_secs(3600))
+        .idle_timeout(std::time::Duration::from_secs(300))
+        .acquire_timeout(std::time::Duration::from_secs(10))
+        .connect(database_url)
+        .await?;
+    tracing::info!(max_connections, "Git-for-data connection pool initialized");
+    Ok(pool)
+}
+
+#[cfg(feature = "server-runtime")]
+fn apply_detected_runtime_topology(
+    cfg: &mut memoria_service::Config,
+    topology: memoria_storage::RuntimeTopology,
+) -> Option<memoria_storage::PendingLegacyMultiDbMigration> {
+    use memoria_storage::RuntimeTopology;
+
+    match topology {
+        RuntimeTopology::FreshSingleDb => {
+            tracing::info!(
+                shared_db_url = %redact_url(&cfg.shared_db_url),
+                "Detected fresh deployment; continuing startup in multi-db mode"
+            );
+            enable_runtime_multi_db(cfg);
+            None
+        }
+        RuntimeTopology::MultiDbReady => {
+            tracing::info!(
+                shared_db_url = %redact_url(&cfg.shared_db_url),
+                "Detected completed shared registry behind legacy config; continuing in multi-db mode"
+            );
+            enable_runtime_multi_db(cfg);
+            None
+        }
+        RuntimeTopology::PendingLegacyMigration(pending) => Some(pending),
+    }
+}
+
+#[cfg(feature = "server-runtime")]
+async fn bootstrap_runtime_topology(cfg: &mut memoria_service::Config) -> Result<()> {
+    use memoria_storage::{
+        detect_runtime_topology, execute_legacy_single_db_to_multi_db,
+        LegacyToMultiDbMigrationOptions,
+    };
+
+    if cfg.multi_db {
+        return Ok(());
+    }
+
+    let Some(pending) = apply_detected_runtime_topology(
+        cfg,
+        detect_runtime_topology(&cfg.db_url, &cfg.shared_db_url).await?,
+    ) else {
+        return Ok(());
+    };
+
+    let migration_concurrency = configured_legacy_migration_concurrency();
+    tracing::info!(
+        legacy_db_name = %pending.legacy_db_name,
+        shared_db_name = %pending.shared_db_name,
+        users = pending.legacy_users.len(),
+        missing_users = pending.missing_users.len(),
+        migration_concurrency,
+        "Auto-migrating legacy single-db deployment before startup"
+    );
+    execute_legacy_single_db_to_multi_db(
+        &cfg.db_url,
+        &cfg.shared_db_url,
+        cfg.embedding_dim,
+        LegacyToMultiDbMigrationOptions {
+            user_ids: Vec::new(),
+            concurrency: migration_concurrency,
+        },
+    )
+    .await?;
+    enable_runtime_multi_db(cfg);
+    tracing::info!(
+        shared_db_url = %redact_url(&cfg.shared_db_url),
+        "Legacy migration completed; continuing startup in multi-db mode"
+    );
+    Ok(())
+}
+
+#[cfg(feature = "server-runtime")]
+fn enable_runtime_multi_db(cfg: &mut memoria_service::Config) {
+    cfg.multi_db = true;
+    if let Some(db_name) = parse_db_name(&cfg.shared_db_url) {
+        cfg.db_name = db_name;
+    }
+}
+
+#[cfg(feature = "server-runtime")]
 async fn cmd_serve(db_url: Option<String>, port: u16, master_key: String) -> Result<()> {
     use memoria_api::{build_router, AppState};
     use memoria_git::GitForDataService;
     use memoria_service::{shutdown_signal, Config, MemoryService};
-    use memoria_storage::SqlMemoryStore;
-    use sqlx::mysql::MySqlPool;
+    use memoria_storage::{DbRouter, SqlMemoryStore};
     use tower_http::trace::TraceLayer;
 
     memoria_api::otel::init_tracing();
@@ -367,9 +531,15 @@ async fn cmd_serve(db_url: Option<String>, port: u16, master_key: String) -> Res
     }
 
     validate_embedding_config(&cfg)?;
+    bootstrap_runtime_topology(&mut cfg).await?;
+    let redacted_db_url = redact_url(&cfg.db_url);
+    let redacted_shared_db_url = redact_url(&cfg.shared_db_url);
 
     tracing::info!(
-        db_url = %cfg.db_url, port = port,
+        db_url = %redacted_db_url,
+        shared_db_url = %redacted_shared_db_url,
+        multi_db = cfg.multi_db,
+        port = port,
         instance_id = %cfg.instance_id,
         has_llm = cfg.has_llm(),
         embedding_provider = %cfg.embedding_provider,
@@ -377,22 +547,57 @@ async fn cmd_serve(db_url: Option<String>, port: u16, master_key: String) -> Res
         "Starting Memoria API server"
     );
 
-    let store =
-        SqlMemoryStore::connect(&cfg.db_url, cfg.embedding_dim, cfg.instance_id.clone()).await?;
-    store.migrate().await?;
-
-    let pool = MySqlPool::connect(&cfg.db_url).await?;
-    let git = Arc::new(GitForDataService::new(pool, &cfg.db_name));
+    let (store, db_router, git) = if cfg.multi_db {
+        let router = Arc::new(
+            DbRouter::connect(
+                &cfg.shared_db_url,
+                cfg.embedding_dim,
+                cfg.instance_id.clone(),
+            )
+            .await?,
+        );
+        let shared_pool = router.shared_pool().clone();
+        let shared_pool_max_connections = router.shared_pool_max_connections();
+        tracing::info!(
+            shared_pool_max_connections,
+            "Reusing shared database pool for shared store and git service"
+        );
+        let mut store = SqlMemoryStore::from_existing_pool(
+            shared_pool.clone(),
+            cfg.embedding_dim,
+            cfg.instance_id.clone(),
+            Some(cfg.shared_db_url.clone()),
+            Some(shared_pool_max_connections),
+            "shared_db_merged_pool",
+        );
+        store.migrate_shared().await?;
+        store.set_db_router(router.clone());
+        let git = Arc::new(GitForDataService::new(
+            shared_pool,
+            router.shared_db_name().to_string(),
+        ));
+        (Arc::new(store), Some(router), git)
+    } else {
+        let store =
+            SqlMemoryStore::connect(&cfg.db_url, cfg.embedding_dim, cfg.instance_id.clone())
+                .await?;
+        store.migrate().await?;
+        let pool = connect_git_pool(&cfg.db_url, false).await?;
+        let git_db_name = parse_db_name(&cfg.db_url).unwrap_or_else(|| cfg.db_name.clone());
+        let git = Arc::new(GitForDataService::new(pool, git_db_name));
+        (Arc::new(store), None, git)
+    };
 
     let embedder = build_embedder(&cfg);
     let llm = build_llm(&cfg);
 
-    let service = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), embedder, llm).await);
+    let service =
+        Arc::new(MemoryService::new_sql_with_llm_and_router(store, db_router, embedder, llm).await);
     Arc::new(memoria_service::GovernanceScheduler::from_config(service.clone(), &cfg).await?)
         .start();
     let state = AppState::new(service.clone(), git, master_key)
         .with_instance_id(cfg.instance_id.clone())
-        .init_auth_pool(&cfg.db_url)
+        .init_auth_pool(cfg.effective_sql_url(), cfg.ops_metrics_enabled)
         .await?;
 
     let app = build_router(state.clone()).layer(TraceLayer::new_for_http());
@@ -408,9 +613,56 @@ async fn cmd_serve(db_url: Option<String>, port: u16, master_key: String) -> Res
     Ok(())
 }
 
+fn parse_db_name(database_url: &str) -> Option<String> {
+    let suffix_start = database_url.find(['?', '#']).unwrap_or(database_url.len());
+    let without_suffix = &database_url[..suffix_start];
+    let (_, db_name) = without_suffix.rsplit_once('/')?;
+    if db_name.is_empty() {
+        return None;
+    }
+    Some(db_name.to_string())
+}
+
+fn redact_url(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    let Some((userinfo, host)) = rest.split_once('@') else {
+        return url.to_string();
+    };
+    if userinfo.is_empty() {
+        return url.to_string();
+    }
+    let redacted_userinfo = if userinfo.contains(':') {
+        "***:***"
+    } else {
+        "***"
+    };
+    format!("{scheme}://{redacted_userinfo}@{host}")
+}
+
+fn normalize_tool_name(tool: Option<String>) -> Option<String> {
+    tool.and_then(|raw| {
+        // Normalize to the same format the dashboard uses:
+        // trim, lowercase, collapse whitespace runs into a single hyphen.
+        // "My Agent" → "my-agent", "cursor" → "cursor".
+        let lower = raw.trim().to_ascii_lowercase();
+        let normalized = lower
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join("-");
+        if normalized.is_empty() {
+            None
+        } else {
+            Some(normalized)
+        }
+    })
+}
+
 // ── MCP server ────────────────────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "server-runtime")]
 async fn cmd_mcp(
     tool: Option<String>,
     api_url: Option<String>,
@@ -430,8 +682,7 @@ async fn cmd_mcp(
 ) -> Result<()> {
     use memoria_git::GitForDataService;
     use memoria_service::{Config, MemoryService};
-    use memoria_storage::SqlMemoryStore;
-    use sqlx::mysql::MySqlPool;
+    use memoria_storage::{DbRouter, SqlMemoryStore};
 
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -482,9 +733,15 @@ async fn cmd_mcp(
     if let Some(v) = db_name {
         cfg.db_name = v;
     }
+    validate_embedding_config(&cfg)?;
+    bootstrap_runtime_topology(&mut cfg).await?;
+    let redacted_db_url = redact_url(&cfg.db_url);
+    let redacted_shared_db_url = redact_url(&cfg.shared_db_url);
 
     tracing::info!(
-        db_url = %cfg.db_url,
+        db_url = %redacted_db_url,
+        shared_db_url = %redacted_shared_db_url,
+        multi_db = cfg.multi_db,
         embedding_provider = %cfg.embedding_provider,
         has_llm = cfg.has_llm(),
         governance_plugin_binding = %cfg.governance_plugin_binding,
@@ -492,17 +749,52 @@ async fn cmd_mcp(
         "Starting Memoria MCP (embedded mode)"
     );
 
-    let store =
-        SqlMemoryStore::connect(&cfg.db_url, cfg.embedding_dim, cfg.instance_id.clone()).await?;
-    store.migrate().await?;
-
-    let pool = MySqlPool::connect(&cfg.db_url).await?;
-    let git = Arc::new(GitForDataService::new(pool, &cfg.db_name));
+    let (store, db_router, git) = if cfg.multi_db {
+        let router = Arc::new(
+            DbRouter::connect(
+                &cfg.shared_db_url,
+                cfg.embedding_dim,
+                cfg.instance_id.clone(),
+            )
+            .await?,
+        );
+        let shared_pool = router.shared_pool().clone();
+        let shared_pool_max_connections = router.shared_pool_max_connections();
+        tracing::info!(
+            shared_pool_max_connections,
+            "Reusing shared database pool for shared store and git service"
+        );
+        let mut store = SqlMemoryStore::from_existing_pool(
+            shared_pool.clone(),
+            cfg.embedding_dim,
+            cfg.instance_id.clone(),
+            Some(cfg.shared_db_url.clone()),
+            Some(shared_pool_max_connections),
+            "shared_db_merged_pool",
+        );
+        store.migrate_shared().await?;
+        store.set_db_router(router.clone());
+        let git = Arc::new(GitForDataService::new(
+            shared_pool,
+            router.shared_db_name().to_string(),
+        ));
+        (Arc::new(store), Some(router), git)
+    } else {
+        let store =
+            SqlMemoryStore::connect(&cfg.db_url, cfg.embedding_dim, cfg.instance_id.clone())
+                .await?;
+        store.migrate().await?;
+        let pool = connect_git_pool(&cfg.db_url, false).await?;
+        let git_db_name = parse_db_name(&cfg.db_url).unwrap_or_else(|| cfg.db_name.clone());
+        let git = Arc::new(GitForDataService::new(pool, git_db_name));
+        (Arc::new(store), None, git)
+    };
 
     let embedder = build_embedder(&cfg);
     let llm = build_llm(&cfg);
 
-    let service = Arc::new(MemoryService::new_sql_with_llm(Arc::new(store), embedder, llm).await);
+    let service =
+        Arc::new(MemoryService::new_sql_with_llm_and_router(store, db_router, embedder, llm).await);
     Arc::new(memoria_service::GovernanceScheduler::from_config(service.clone(), &cfg).await?)
         .start();
 
@@ -764,6 +1056,124 @@ async fn cmd_plugin(command: PluginCommands) -> Result<()> {
     Ok(())
 }
 
+async fn cmd_migrate(command: MigrationCommands) -> Result<()> {
+    use memoria_storage::{
+        execute_legacy_single_db_to_multi_db, plan_legacy_single_db_to_multi_db,
+        LegacyToMultiDbMigrationOptions, LegacyToMultiDbMigrationReport, TableMigrationReport,
+    };
+
+    fn print_table_group(label: &str, items: &[TableMigrationReport]) {
+        if items.is_empty() {
+            return;
+        }
+        println!("{label}:");
+        for item in items {
+            let target = item
+                .target_rows
+                .map(|rows| rows.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            let note = item
+                .note
+                .as_deref()
+                .map(|note| format!(" ({note})"))
+                .unwrap_or_default();
+            println!(
+                "  - {}\tsource={}\ttarget={}\tstatus={}{}",
+                item.table_name, item.source_rows, target, item.status, note
+            );
+        }
+    }
+
+    fn print_report(report: &LegacyToMultiDbMigrationReport) {
+        println!(
+            "Migration mode: {}",
+            if report.dry_run { "dry-run" } else { "execute" }
+        );
+        println!(
+            "Legacy DB: {}\nShared DB: {}\nUsers: {}",
+            report.legacy_db_name,
+            report.shared_db_name,
+            report.selected_users.len()
+        );
+        if let Some(snapshot) = report.pre_execute_account_snapshot.as_deref() {
+            println!("Pre-execute account snapshot: {snapshot}");
+        }
+        if !report.skipped_shared_runtime_tables.is_empty() {
+            println!(
+                "Skipped runtime tables: {}",
+                report.skipped_shared_runtime_tables.join(", ")
+            );
+        }
+        if !report.warnings.is_empty() {
+            println!("Warnings:");
+            for warning in &report.warnings {
+                println!("  - {warning}");
+            }
+        }
+        print_table_group("Shared tables", &report.shared_tables);
+        for user in &report.users {
+            println!(
+                "\nUser {}\n  target_db={}\n  active_branch={}\n  active_legacy_snapshots={}",
+                user.user_id,
+                user.target_db,
+                user.active_branch.as_deref().unwrap_or("main"),
+                user.active_snapshot_count
+            );
+            for warning in &user.warnings {
+                println!("  warning: {warning}");
+            }
+            print_table_group("  User tables", &user.tables);
+            print_table_group("  Branch tables", &user.branch_tables);
+        }
+    }
+
+    match command {
+        MigrationCommands::LegacyToMultiDb {
+            legacy_db_url,
+            shared_db_url,
+            embedding_dim,
+            user_ids,
+            concurrency,
+            execute,
+            report_out,
+        } => {
+            let options = LegacyToMultiDbMigrationOptions {
+                user_ids,
+                concurrency,
+            };
+            let report = if execute {
+                execute_legacy_single_db_to_multi_db(
+                    &legacy_db_url,
+                    &shared_db_url,
+                    embedding_dim,
+                    options,
+                )
+                .await?
+            } else {
+                plan_legacy_single_db_to_multi_db(
+                    &legacy_db_url,
+                    &shared_db_url,
+                    embedding_dim,
+                    options,
+                )
+                .await?
+            };
+            print_report(&report);
+            if let Some(path) = report_out {
+                std::fs::write(&path, serde_json::to_string_pretty(&report)?)?;
+                println!("Saved report: {path}");
+            }
+            if report.dry_run {
+                println!(
+                    "\nDry run only. Stop writers, resolve warnings, then rerun with --execute."
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
 // ── Plugin scaffolding ────────────────────────────────────────────────────────
 
 fn cmd_plugin_init(dir: &Path, name: &str, capabilities: &str, runtime: &str) -> Result<()> {
@@ -849,6 +1259,7 @@ fn cmd_plugin_dev_keygen(dir: &Path) -> Result<()> {
 fn build_embedder(
     cfg: &memoria_service::Config,
 ) -> Option<Arc<dyn memoria_core::interfaces::EmbeddingProvider>> {
+    #[cfg(feature = "server-runtime")]
     use memoria_api::InstrumentedEmbedder;
     use memoria_embedding::{HttpEmbedder, RoundRobinEmbedder};
 
@@ -918,8 +1329,16 @@ fn build_embedder(
         return None;
     };
 
-    Some(Arc::new(InstrumentedEmbedder::new(raw, provider_label))
-        as Arc<dyn memoria_core::interfaces::EmbeddingProvider>)
+    #[cfg(feature = "server-runtime")]
+    {
+        Some(Arc::new(InstrumentedEmbedder::new(raw, provider_label))
+            as Arc<dyn memoria_core::interfaces::EmbeddingProvider>)
+    }
+    #[cfg(not(feature = "server-runtime"))]
+    {
+        let _ = provider_label;
+        Some(raw)
+    }
 }
 
 fn validate_embedding_config(cfg: &memoria_service::Config) -> Result<()> {
@@ -1029,9 +1448,55 @@ fn mcp_entry(
     full_args.push(tool_name.to_string());
     full_args.extend(args);
 
+    // All Memoria MCP tools — used to populate autoApprove so that
+    // editors like Kiro and Cursor do not prompt on every memory operation.
+    // The user has already established trust by installing Memoria and
+    // providing an API token; requiring per-call approval defeats ambient
+    // memory workflows.  Editors that do not recognise the field ignore it.
+    let auto_approve: Vec<serde_json::Value> = vec![
+        "memory_store",
+        "memory_retrieve",
+        "memory_search",
+        "memory_list",
+        "memory_correct",
+        "memory_purge",
+        "memory_profile",
+        "memory_feedback",
+        "memory_capabilities",
+        "memory_governance",
+        "memory_consolidate",
+        "memory_reflect",
+        "memory_snapshot",
+        "memory_snapshots",
+        "memory_snapshot_delete",
+        "memory_rollback",
+        "memory_branch",
+        "memory_branches",
+        "memory_checkout",
+        "memory_merge",
+        "memory_branch_delete",
+        "memory_diff",
+        "memory_count",
+        "memory_observe",
+        "memory_id",
+        "memory_ids",
+        "memory_type",
+        "memory_extract_entities",
+        "memory_link_entities",
+        "memory_graph_nodes",
+        "memory_graph_edges",
+        "memory_get_retrieval_params",
+        "memory_tune_params",
+        "memory_rebuild_index",
+    ]
+    .into_iter()
+    .map(serde_json::Value::from)
+    .collect();
+
     let mut entry = serde_json::json!({
         "command": "memoria",
         "args": full_args,
+        "autoApprove": auto_approve,
     });
     if !env.is_empty() {
         entry["env"] = serde_json::Value::Object(env);
@@ -2906,6 +3371,7 @@ fn main() -> Result<()> {
     let project_dir = cli.dir.canonicalize().unwrap_or(cli.dir);
 
     match cli.command {
+        #[cfg(feature = "server-runtime")]
         Commands::Serve {
             db_url,
             port,
@@ -2916,6 +3382,7 @@ fn main() -> Result<()> {
                 .build()?
                 .block_on(cmd_serve(db_url, port, master_key))?;
         }
+        #[cfg(feature = "server-runtime")]
         Commands::Mcp {
             tool,
             api_url,
@@ -2933,11 +3400,12 @@ fn main() -> Result<()> {
             transport,
             mcp_port,
         } => {
+            let tool = normalize_tool_name(tool);
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?
                 .block_on(cmd_mcp(
-                    tool.map(|t| t.to_string()),
+                    tool,
                     api_url,
                     token,
                     db_url,
@@ -3019,17 +3487,36 @@ fn main() -> Result<()> {
                 .build()?
                 .block_on(cmd_plugin(command))?;
         }
+        Commands::Migrate { command } => {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?
+                .block_on(cmd_migrate(command))?;
+        }
     }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{run_with_edit_log_drain, validate_embedding_config};
+    #[cfg(feature = "server-runtime")]
+    use super::{
+        apply_detected_runtime_topology, configured_legacy_migration_concurrency,
+        LEGACY_MIGRATION_MAX_CONCURRENCY_ENV,
+    };
+    use super::{
+        enable_runtime_multi_db, normalize_tool_name, redact_url, run_with_edit_log_drain,
+        validate_embedding_config, Cli, Commands, MigrationCommands,
+    };
     use async_trait::async_trait;
+    use clap::Parser;
     use memoria_core::{interfaces::MemoryStore, MemoriaError, Memory};
     use memoria_service::{Config, MemoryService};
     use memoria_storage::OwnedEditLogEntry;
+    #[cfg(feature = "server-runtime")]
+    use memoria_storage::{PendingLegacyMultiDbMigration, RuntimeTopology};
+    #[cfg(feature = "server-runtime")]
+    use std::sync::OnceLock;
     use std::sync::{Arc, Mutex};
 
     #[derive(Default)]
@@ -3080,6 +3567,8 @@ mod tests {
         Config {
             db_url: "mysql://root:111@localhost:6001/memoria".to_string(),
             db_name: "memoria".to_string(),
+            shared_db_url: "mysql://root:111@localhost:6001/memoria_shared".to_string(),
+            multi_db: false,
             embedding_provider: "openai".to_string(),
             embedding_model: "BAAI/bge-m3".to_string(),
             embedding_dim: 1024,
@@ -3095,7 +3584,75 @@ mod tests {
             governance_plugin_dir: None,
             instance_id: "test-instance".to_string(),
             lock_ttl_secs: 120,
+            ops_metrics_enabled: false,
         }
+    }
+
+    #[cfg(feature = "server-runtime")]
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    #[cfg(feature = "server-runtime")]
+    fn with_env<F: FnOnce()>(vars: &[(&str, Option<&str>)], f: F) {
+        let _lock = ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        struct EnvGuard(Vec<(String, Option<std::ffi::OsString>)>);
+
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                for (key, old) in &self.0 {
+                    match old {
+                        Some(value) => unsafe { std::env::set_var(key, value) },
+                        None => unsafe { std::env::remove_var(key) },
+                    }
+                }
+            }
+        }
+
+        let _restore = EnvGuard(
+            vars.iter()
+                .map(|(key, value)| {
+                    let old = std::env::var_os(key);
+                    match value {
+                        Some(value) => unsafe { std::env::set_var(key, value) },
+                        None => unsafe { std::env::remove_var(key) },
+                    }
+                    (key.to_string(), old)
+                })
+                .collect(),
+        );
+
+        f();
+    }
+
+    #[cfg(feature = "server-runtime")]
+    #[test]
+    fn legacy_migration_concurrency_defaults_to_six() {
+        with_env(
+            &[
+                (LEGACY_MIGRATION_MAX_CONCURRENCY_ENV, None),
+                ("MEMORIA_USER_SCHEMA_INIT_MAX_CONCURRENCY", None),
+            ],
+            || {
+                assert_eq!(configured_legacy_migration_concurrency(), 6);
+            },
+        );
+    }
+
+    #[cfg(feature = "server-runtime")]
+    #[test]
+    fn legacy_migration_concurrency_prefers_dedicated_override() {
+        with_env(
+            &[
+                (LEGACY_MIGRATION_MAX_CONCURRENCY_ENV, Some("8")),
+                ("MEMORIA_USER_SCHEMA_INIT_MAX_CONCURRENCY", Some("5")),
+            ],
+            || {
+                assert_eq!(configured_legacy_migration_concurrency(), 8);
+            },
+        );
     }
 
     #[test]
@@ -3161,5 +3718,212 @@ mod tests {
         let drained = entries.lock().unwrap();
         assert_eq!(drained.len(), 1);
         assert_eq!(drained[0].operation, "purge");
+    }
+
+    #[test]
+    fn migrate_cli_defaults_to_dry_run() {
+        let cli = Cli::parse_from([
+            "memoria",
+            "migrate",
+            "legacy-to-multi-db",
+            "--legacy-db-url",
+            "mysql://root:111@localhost:6001/memoria",
+            "--shared-db-url",
+            "mysql://root:111@localhost:6001/memoria_shared",
+        ]);
+
+        match cli.command {
+            Commands::Migrate {
+                command:
+                    MigrationCommands::LegacyToMultiDb {
+                        execute, user_ids, ..
+                    },
+            } => {
+                assert!(!execute);
+                assert!(user_ids.is_empty());
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn migrate_cli_accepts_execute_and_users() {
+        let cli = Cli::parse_from([
+            "memoria",
+            "migrate",
+            "legacy-to-multi-db",
+            "--legacy-db-url",
+            "mysql://root:111@localhost:6001/memoria",
+            "--shared-db-url",
+            "mysql://root:111@localhost:6001/memoria_shared",
+            "--execute",
+            "--user",
+            "alice",
+            "--user",
+            "bob",
+        ]);
+
+        match cli.command {
+            Commands::Migrate {
+                command:
+                    MigrationCommands::LegacyToMultiDb {
+                        execute, user_ids, ..
+                    },
+            } => {
+                assert!(execute);
+                assert_eq!(user_ids, vec!["alice".to_string(), "bob".to_string()]);
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn redact_url_masks_credentials() {
+        assert_eq!(
+            redact_url("mysql://root:111@localhost:6001/memoria"),
+            "mysql://***:***@localhost:6001/memoria"
+        );
+    }
+
+    #[test]
+    fn redact_url_leaves_non_credential_urls_unchanged() {
+        assert_eq!(
+            redact_url("mysql://localhost:6001/memoria"),
+            "mysql://localhost:6001/memoria"
+        );
+    }
+
+    #[test]
+    fn normalize_tool_name_trims_lowercases_and_filters_empty() {
+        assert_eq!(
+            normalize_tool_name(Some("  CuRsOr-Agent  ".to_string())),
+            Some("cursor-agent".to_string())
+        );
+        // spaces (and multiple spaces) are collapsed into hyphens,
+        // matching the dashboard's sanitizeAgentName behaviour
+        assert_eq!(
+            normalize_tool_name(Some("My  Agent".to_string())),
+            Some("my-agent".to_string())
+        );
+        assert_eq!(
+            normalize_tool_name(Some("  Claude Code  ".to_string())),
+            Some("claude-code".to_string())
+        );
+        assert_eq!(normalize_tool_name(Some("   ".to_string())), None);
+        assert_eq!(normalize_tool_name(None), None);
+    }
+
+    #[test]
+    fn enable_runtime_multi_db_switches_to_shared_db_name() {
+        let mut cfg = test_config();
+
+        enable_runtime_multi_db(&mut cfg);
+
+        assert!(cfg.multi_db);
+        assert_eq!(cfg.db_name, "memoria_shared");
+        assert_eq!(cfg.db_url, "mysql://root:111@localhost:6001/memoria");
+    }
+
+    #[cfg(feature = "server-runtime")]
+    #[test]
+    fn fresh_topology_bootstrap_defaults_to_multi_db() {
+        let mut cfg = test_config();
+
+        let pending = apply_detected_runtime_topology(&mut cfg, RuntimeTopology::FreshSingleDb);
+
+        assert!(pending.is_none());
+        assert!(cfg.multi_db);
+        assert_eq!(cfg.db_name, "memoria_shared");
+        assert_eq!(cfg.db_url, "mysql://root:111@localhost:6001/memoria");
+    }
+
+    #[cfg(feature = "server-runtime")]
+    #[test]
+    fn multi_db_ready_bootstrap_keeps_multi_db_enabled() {
+        let mut cfg = test_config();
+
+        let pending = apply_detected_runtime_topology(&mut cfg, RuntimeTopology::MultiDbReady);
+
+        assert!(pending.is_none());
+        assert!(cfg.multi_db);
+        assert_eq!(cfg.db_name, "memoria_shared");
+    }
+
+    #[cfg(feature = "server-runtime")]
+    #[test]
+    fn pending_migration_bootstrap_waits_for_migration_before_switching() {
+        let mut cfg = test_config();
+        let pending = PendingLegacyMultiDbMigration {
+            legacy_db_name: "memoria".to_string(),
+            shared_db_name: "memoria_shared".to_string(),
+            legacy_users: vec!["alice".to_string(), "bob".to_string()],
+            missing_users: vec!["bob".to_string()],
+        };
+
+        let migration = apply_detected_runtime_topology(
+            &mut cfg,
+            RuntimeTopology::PendingLegacyMigration(pending.clone()),
+        );
+
+        assert_eq!(migration, Some(pending));
+        assert!(!cfg.multi_db);
+        assert_eq!(cfg.db_name, "memoria");
+    }
+
+    #[test]
+    fn mcp_entry_includes_auto_approve() {
+        use super::mcp_entry;
+
+        // Remote mode
+        let entry = mcp_entry(
+            None,
+            Some("https://cloud.memoria.dev"),
+            Some("tok"),
+            "alice",
+            "kiro",
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let approved = entry["autoApprove"]
+            .as_array()
+            .expect("autoApprove must be an array");
+        assert!(
+            !approved.is_empty(),
+            "autoApprove must contain at least one tool"
+        );
+        // Core tools that the issue specifically calls out
+        for tool in &[
+            "memory_store",
+            "memory_retrieve",
+            "memory_search",
+            "memory_purge",
+        ] {
+            assert!(
+                approved.iter().any(|v| v.as_str() == Some(tool)),
+                "autoApprove is missing tool: {tool}"
+            );
+        }
+
+        // Embedded mode
+        let entry_embedded = mcp_entry(
+            Some("mysql://root:111@localhost:6001/memoria"),
+            None,
+            None,
+            "alice",
+            "cursor",
+            Some("openai"),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(
+            entry_embedded["autoApprove"].is_array(),
+            "autoApprove must be present in embedded mode too"
+        );
     }
 }

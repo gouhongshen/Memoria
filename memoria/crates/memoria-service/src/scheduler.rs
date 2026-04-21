@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use memoria_storage::SqlMemoryStore;
+use memoria_storage::{configured_multi_db_pool_size, MultiDbPoolKind, SqlMemoryStore};
 use tokio::time::{interval, Duration};
 use tracing::{error, info, warn};
 
@@ -42,6 +42,7 @@ pub struct GovernanceScheduler {
     lock: Arc<dyn DistributedLock>,
     instance_id: String,
     lock_ttl: Duration,
+    isolated_pool_max_connections: Option<u32>,
 }
 
 #[derive(Clone)]
@@ -79,34 +80,71 @@ impl GovernanceScheduler {
 
         // Create an isolated pool for governance so long-running operations
         // (consolidation, cleanup, DDL rebuilds) do not starve request connections.
+        let governance_pool_size = match std::env::var("GOVERNANCE_POOL_SIZE")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+        {
+            Some(0) => 0,
+            Some(raw) => raw.clamp(
+                1,
+                memoria_storage::multi_db_pool_max_size(MultiDbPoolKind::Governance),
+            ),
+            None if service.db_router.is_some() => {
+                configured_multi_db_pool_size("GOVERNANCE_POOL_SIZE", MultiDbPoolKind::Governance)
+            }
+            None => 4,
+        };
         #[allow(clippy::type_complexity)]
-        let (gov_store, gov_sql_store, lock): (
+        let (gov_store, gov_sql_store, lock, isolated_pool_max_connections): (
             Option<Arc<dyn GovernanceStore>>,
             Option<Arc<SqlMemoryStore>>,
             Arc<dyn DistributedLock>,
+            Option<u32>,
         ) = match &service.sql_store {
-            Some(store) => match store.spawn_background_store(4).await {
-                Ok(bg) => {
-                    info!("Governance scheduler using isolated pool (4 connections)");
-                    (
-                        Some(bg.clone() as Arc<dyn GovernanceStore>),
-                        Some(bg.clone()),
-                        bg as Arc<dyn DistributedLock>,
-                    )
-                }
-                Err(e) => {
-                    warn!(error = %e, "Governance isolated pool failed, falling back to main pool");
+            Some(store) => {
+                if governance_pool_size == 0 {
+                    info!("Governance isolated pool disabled; falling back to main pool");
                     (
                         Some(store.clone() as Arc<dyn GovernanceStore>),
                         Some(store.clone()),
                         store.clone() as Arc<dyn DistributedLock>,
+                        None,
                     )
+                } else {
+                    match store.spawn_background_store(governance_pool_size).await {
+                        Ok(bg) => {
+                            info!(
+                                governance_pool_size,
+                                "Governance scheduler using isolated pool"
+                            );
+                            (
+                                Some(bg.clone() as Arc<dyn GovernanceStore>),
+                                Some(bg.clone()),
+                                bg as Arc<dyn DistributedLock>,
+                                Some(governance_pool_size),
+                            )
+                        }
+                        Err(e) => {
+                            warn!(
+                                error = %e,
+                                governance_pool_size,
+                                "Governance isolated pool failed, falling back to main pool"
+                            );
+                            (
+                                Some(store.clone() as Arc<dyn GovernanceStore>),
+                                Some(store.clone()),
+                                store.clone() as Arc<dyn DistributedLock>,
+                                None,
+                            )
+                        }
+                    }
                 }
-            },
+            }
             None => (
                 None,
                 None,
                 Arc::new(crate::distributed::NoopDistributedLock) as Arc<dyn DistributedLock>,
+                None,
             ),
         };
 
@@ -114,7 +152,7 @@ impl GovernanceScheduler {
         let build = |strategy: Arc<dyn GovernanceStrategy>,
                      fallback: Arc<dyn GovernanceStrategy>,
                      plugin: Option<ObservedPlugin>| {
-            Self::new_with_components(
+            let mut scheduler = Self::new_with_components(
                 gov_store.clone(),
                 gov_sql_store.clone(),
                 strategy,
@@ -124,7 +162,9 @@ impl GovernanceScheduler {
                 lock.clone(),
                 instance_id.clone(),
                 lock_ttl,
-            )
+            );
+            scheduler.isolated_pool_max_connections = isolated_pool_max_connections;
+            scheduler
         };
 
         // Dev mode: load plugin directly from local filesystem (hot-reload friendly)
@@ -304,6 +344,7 @@ impl GovernanceScheduler {
             lock,
             instance_id,
             lock_ttl,
+            isolated_pool_max_connections: None,
         }
     }
 
@@ -313,6 +354,16 @@ impl GovernanceScheduler {
 
     pub fn fallback_strategy_key(&self) -> &str {
         self.fallback_strategy.strategy_key()
+    }
+
+    pub fn isolated_pool_max_connections(&self) -> Option<u32> {
+        self.isolated_pool_max_connections
+    }
+
+    pub fn sql_store_configured_max_connections(&self) -> Option<u32> {
+        self.sql_store
+            .as_ref()
+            .and_then(|store| store.configured_max_connections())
     }
 
     /// Spawn background tasks. Returns immediately; tasks run in background.
@@ -1359,6 +1410,8 @@ mod tests {
         let config = Config {
             db_url: "mysql://root:111@localhost:6001/memoria".into(),
             db_name: "memoria".into(),
+            shared_db_url: "mysql://root:111@localhost:6001/memoria_shared".into(),
+            multi_db: false,
             embedding_provider: "mock".into(),
             embedding_model: "BAAI/bge-m3".into(),
             embedding_dim: 1024,
@@ -1374,6 +1427,7 @@ mod tests {
             governance_plugin_dir: None,
             instance_id: "test-instance".into(),
             lock_ttl_secs: 120,
+            ops_metrics_enabled: false,
         };
         let scheduler = tokio::runtime::Runtime::new()
             .unwrap()

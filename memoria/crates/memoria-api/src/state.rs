@@ -2,11 +2,15 @@ use crate::auth::{
     spawn_call_log_flusher, spawn_last_used_flusher, spawn_tool_usage_flusher, CallLogBatcher,
     LastUsedBatcher, ToolUsageBatcher,
 };
+use crate::metrics_summary::MetricsSummaryManager;
 use crate::rate_limit::RateLimiter;
 use memoria_core::MemoriaError;
 use memoria_git::GitForDataService;
-use memoria_service::{AsyncTaskStore, MemoryService};
-use moka::future::Cache;
+use memoria_service::{AsyncTaskStore, MemoryService, StatsReporter};
+use memoria_storage::store::spawn_pool_monitor;
+use memoria_storage::PoolHealthSnapshot;
+use memoria_storage::{configured_multi_db_pool_size, multi_db_pool_max_size, MultiDbPoolKind};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
@@ -14,12 +18,63 @@ use tracing::{info, warn};
 
 /// Hard upper bounds to prevent misconfiguration.
 const METRICS_CACHE_TTL_MAX_SECS: u64 = 300; // 5 min
-const AUTH_POOL_MAX_CONNECTIONS_UPPER: u32 = 64;
 const AUTH_POOL_ACQUIRE_TIMEOUT_MAX_SECS: u64 = 30;
 
 pub struct CachedMetrics {
     pub body: Arc<String>,
     pub generated_at: Instant,
+}
+
+struct ApiKeyCacheEntry {
+    user_id: String,
+    cached_at: Instant,
+}
+
+#[derive(Clone)]
+pub struct ApiKeyCache {
+    ttl: Duration,
+    inner: Arc<std::sync::RwLock<HashMap<String, ApiKeyCacheEntry>>>,
+}
+
+impl ApiKeyCache {
+    pub fn new(ttl: Duration) -> Self {
+        Self {
+            ttl,
+            inner: Arc::new(std::sync::RwLock::new(HashMap::new())),
+        }
+    }
+
+    pub fn get(&self, key_hash: &str) -> Option<String> {
+        let now = Instant::now();
+        if let Ok(cache) = self.inner.read() {
+            if let Some(entry) = cache.get(key_hash) {
+                if now.duration_since(entry.cached_at) < self.ttl {
+                    return Some(entry.user_id.clone());
+                }
+            }
+        }
+
+        self.invalidate(key_hash);
+        None
+    }
+
+    pub fn insert(&self, key_hash: String, user_id: String) {
+        if let Ok(mut cache) = self.inner.write() {
+            cache.insert(
+                key_hash,
+                ApiKeyCacheEntry {
+                    user_id,
+                    cached_at: Instant::now(),
+                },
+            );
+        }
+    }
+
+    pub fn invalidate(&self, key_hash: &str) {
+        if let Ok(mut cache) = self.inner.write() {
+            cache.remove(key_hash);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -33,9 +88,10 @@ pub struct AppState {
     /// Instance identifier for distributed coordination
     pub instance_id: String,
     /// API key hash -> user_id cache (TTL 5 min)
-    pub api_key_cache: Cache<String, String>,
+    pub api_key_cache: ApiKeyCache,
     /// Dedicated connection pool for auth queries (isolated from business queries)
     pub auth_pool: Option<sqlx::MySqlPool>,
+    auth_pool_max_connections: Option<u32>,
     /// Batched last_used_at updater
     pub last_used_batcher: Arc<LastUsedBatcher>,
     /// Batched per-user tool usage tracker (flushed every 10 min)
@@ -45,8 +101,11 @@ pub struct AppState {
     /// Short-lived cache for Prometheus output to avoid repeated full-table scans.
     pub metrics_cache: Arc<RwLock<Option<CachedMetrics>>>,
     pub metrics_cache_ttl: Duration,
+    pub metrics_summary: Option<Arc<MetricsSummaryManager>>,
     /// Batched API call log writer (flushed every 5 s to mem_api_call_log).
     pub call_log_batcher: Arc<CallLogBatcher>,
+    /// Push-based operational metrics reporter for admin dashboard.
+    pub stats_reporter: Option<Arc<StatsReporter>>,
     /// Shutdown signal + task handles for background flushers.
     /// Wrapped together so drain_flushers() can take ownership of the sender.
     flusher_state: Arc<std::sync::Mutex<FlusherState>>,
@@ -92,17 +151,17 @@ impl AppState {
             master_key,
             task_store,
             instance_id: "single".into(),
-            api_key_cache: Cache::builder()
-                .max_capacity(10_000)
-                .time_to_live(Duration::from_secs(300))
-                .build(),
+            api_key_cache: ApiKeyCache::new(Duration::from_secs(300)),
             auth_pool: None,
+            auth_pool_max_connections: None,
             last_used_batcher: Arc::new(LastUsedBatcher::new()),
             tool_usage_batcher: Arc::new(ToolUsageBatcher::new()),
             call_log_batcher: Arc::new(CallLogBatcher::new()),
+            stats_reporter: None,
             rate_limiter: crate::rate_limit::from_env(),
             metrics_cache: Arc::new(RwLock::new(None)),
             metrics_cache_ttl,
+            metrics_summary: None,
             flusher_state: Arc::new(std::sync::Mutex::new(FlusherState {
                 shutdown: None,
                 handles: Vec::new(),
@@ -115,18 +174,26 @@ impl AppState {
     ///
     /// This is strict on purpose: if the auth pool cannot be created, startup fails
     /// rather than letting auth traffic spill into the main business pool.
-    pub async fn init_auth_pool(mut self, database_url: &str) -> Result<Self, MemoriaError> {
+    pub async fn init_auth_pool(
+        mut self,
+        database_url: &str,
+        ops_metrics_enabled: bool,
+    ) -> Result<Self, MemoriaError> {
+        let auth_pool_max_connections_upper = multi_db_pool_max_size(MultiDbPoolKind::Auth);
         let auth_max_connections = {
             let raw: u32 = std::env::var("MEMORIA_AUTH_POOL_MAX_CONNECTIONS")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(16);
-            let clamped = raw.clamp(1, AUTH_POOL_MAX_CONNECTIONS_UPPER);
+                .unwrap_or(configured_multi_db_pool_size(
+                    "MEMORIA_AUTH_POOL_MAX_CONNECTIONS",
+                    MultiDbPoolKind::Auth,
+                ));
+            let clamped = raw.clamp(1, auth_pool_max_connections_upper);
             if clamped != raw {
                 warn!(
                     raw = raw,
                     clamped = clamped,
-                    max = AUTH_POOL_MAX_CONNECTIONS_UPPER,
+                    max = auth_pool_max_connections_upper,
                     "MEMORIA_AUTH_POOL_MAX_CONNECTIONS clamped to bounds"
                 );
             }
@@ -164,6 +231,14 @@ impl AppState {
             acquire_timeout_secs = auth_acquire_timeout.as_secs(),
             "Dedicated auth connection pool initialized"
         );
+        spawn_pool_monitor(
+            pool.clone(),
+            Some(auth_max_connections),
+            Arc::new(std::sync::Mutex::new(PoolHealthSnapshot::new(Some(
+                auth_max_connections,
+            )))),
+            "auth_pool",
+        );
         // Start the batched last_used_at flusher using the auth pool
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
         let h1 = spawn_last_used_flusher(
@@ -171,20 +246,60 @@ impl AppState {
             pool.clone(),
             shutdown_rx.clone(),
         );
-        // Rebuild tool-usage cache from DB, then start the periodic flusher
-        self.tool_usage_batcher.rebuild_from_db(&pool).await;
+        let multi_db_mode = self
+            .service
+            .sql_store
+            .as_ref()
+            .and_then(|sql| sql.db_router())
+            .is_some();
+
+        // Initialise push-based operational metrics reporter when enabled.
+        // Uses the same auth pool (shared DB) to write aggregate counters.
+        if ops_metrics_enabled {
+            let reporter = Arc::new(StatsReporter::new(pool.clone()));
+            // Inject into MemoryService so write-path hooks can report events.
+            self.service.init_stats(reporter.clone());
+            info!("Ops metrics reporter initialized");
+            self.stats_reporter = Some(reporter);
+        }
+
+        // In multi-db mode, eager rebuild would fan out across every user DB and can
+        // block startup for large tenants. Load per-user tool usage lazily instead.
+        if multi_db_mode {
+            info!("Skipping eager tool-usage rebuild in multi-db mode");
+        } else {
+            self.tool_usage_batcher.rebuild_from_db(&self.service).await;
+        }
         let h2 = spawn_tool_usage_flusher(
             self.tool_usage_batcher.clone(),
-            pool.clone(),
+            self.service.clone(),
             shutdown_rx.clone(),
         );
         // Start the call-log flush loop (writes mem_api_call_log every 5 s)
-        let h3 = spawn_call_log_flusher(self.call_log_batcher.clone(), pool.clone(), shutdown_rx);
+        let h3 = spawn_call_log_flusher(
+            self.call_log_batcher.clone(),
+            self.service.clone(),
+            shutdown_rx.clone(),
+        );
+
+        let mut handles = vec![h1, h2, h3];
+        if multi_db_mode {
+            let manager = Arc::new(MetricsSummaryManager::new(
+                self.service.clone(),
+                pool.clone(),
+                self.metrics_cache.clone(),
+            ));
+            manager.ensure_schema().await?;
+            handles.push(manager.clone().spawn(shutdown_rx.clone()));
+            self.metrics_summary = Some(manager);
+            info!("Metrics summary refresher initialized for multi-db mode");
+        }
         self.auth_pool = Some(pool);
+        self.auth_pool_max_connections = Some(auth_max_connections);
         {
             let mut fs = self.flusher_state.lock().unwrap();
             fs.shutdown = Some(shutdown_tx);
-            fs.handles = vec![h1, h2, h3];
+            fs.handles = handles;
         }
         Ok(self)
     }
@@ -192,6 +307,21 @@ impl AppState {
     pub fn with_instance_id(mut self, instance_id: String) -> Self {
         self.instance_id = instance_id;
         self
+    }
+
+    pub fn auth_pool_max_connections(&self) -> Option<u32> {
+        self.auth_pool_max_connections
+    }
+
+    pub async fn mark_metrics_dirty(
+        &self,
+        user_id: &str,
+        mask: crate::metrics_summary::DirtyMask,
+    ) -> Result<(), MemoriaError> {
+        if let Some(summary) = &self.metrics_summary {
+            summary.mark_user_dirty(user_id, mask).await?;
+        }
+        Ok(())
     }
 
     /// Signal all background flushers to stop, wait for final flush to complete.
@@ -302,12 +432,13 @@ mod tests {
         assert_eq!(5u64.clamp(1, METRICS_CACHE_TTL_MAX_SECS), 5);
 
         // auth pool max_connections clamping
-        assert_eq!(0u32.clamp(1, AUTH_POOL_MAX_CONNECTIONS_UPPER), 1);
+        let auth_pool_max_connections_upper = multi_db_pool_max_size(MultiDbPoolKind::Auth);
+        assert_eq!(0u32.clamp(1, auth_pool_max_connections_upper), 1);
         assert_eq!(
-            200u32.clamp(1, AUTH_POOL_MAX_CONNECTIONS_UPPER),
-            AUTH_POOL_MAX_CONNECTIONS_UPPER
+            999u32.clamp(1, auth_pool_max_connections_upper),
+            auth_pool_max_connections_upper
         );
-        assert_eq!(8u32.clamp(1, AUTH_POOL_MAX_CONNECTIONS_UPPER), 8);
+        assert_eq!(8u32.clamp(1, auth_pool_max_connections_upper), 8);
 
         // auth pool acquire_timeout clamping
         assert_eq!(0u64.clamp(1, AUTH_POOL_ACQUIRE_TIMEOUT_MAX_SECS), 1);
